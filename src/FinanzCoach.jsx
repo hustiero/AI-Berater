@@ -6,7 +6,8 @@ import {
   Home, Briefcase, ArrowLeftRight, Eye, MessageCircle, Plus, X, Trash2,
   Settings as SettingsIcon, TrendingUp, TrendingDown, Send, RotateCcw,
   Sparkles, AlertTriangle, ChevronRight, ArrowLeft, Loader2, Check,
-  Filter, ArrowUpDown, ShieldAlert, Info,
+  Filter, ArrowUpDown, ShieldAlert, Info, Pencil, Flame, Microscope,
+  RefreshCw, Cloud, CloudUpload, CloudDownload, Copy,
 } from 'lucide-react';
 
 /* =========================================================
@@ -461,6 +462,102 @@ WICHTIG: Ergänze, korrigiere nicht aggressiv. Bestehende User-Notes (separates 
 }
 
 /* =========================================================
+   Watchlist-Generator (Themen-Watchlist) & Trending
+   ========================================================= */
+
+async function generateWatchlistFromTheme({ theme, count, excludeTickers, apiKey }) {
+  if (!apiKey) throw new Error('Anthropic API-Key fehlt (Einstellungen).');
+  const n = Math.max(3, Math.min(8, Number(count) || 5));
+  const exclude = (excludeTickers || []).join(', ');
+  const system = `Du bist ein Equity-Research-Analyst. Schlage konkrete Aktien/ETFs zu einem Investment-Thema vor, recherchiere mit web_search wenn nötig (max 3 Suchen).
+
+Antworte AUSSCHLIESSLICH mit einem validen JSON-Array – kein Markdown, kein Text drumherum:
+[{"ticker":"NVDA","name":"NVIDIA","currency":"USD","thesis":"<max 100 Zeichen>"}]
+
+Regeln:
+- Realistische Ticker (Yahoo-Schreibweise, z.B. ROG.SW für SIX-Listing).
+- Currency exakt einer aus: CHF, USD, EUR, SEK, GBP.
+- Genau ${n} Vorschläge.
+- KEINE dieser Ticker (User hält / hat schon auf Watchlist): ${exclude || '(keine)'}`;
+
+  const reply = await callClaude({
+    system,
+    messages: [{ role: 'user', content: `Generiere mir ${n} Investment-Ideen zum Thema: ${theme}` }],
+    apiKey,
+    model: MODEL_COACH,
+    maxTokens: 1800,
+    tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
+  });
+  const match = reply.match(/\[[\s\S]*\]/);
+  if (!match) throw new Error('AI lieferte kein JSON-Array.');
+  let parsed;
+  try { parsed = JSON.parse(match[0]); } catch { throw new Error('AI-JSON nicht parsebar.'); }
+  if (!Array.isArray(parsed)) throw new Error('AI-Antwort ist kein Array.');
+  const skip = new Set((excludeTickers || []).map((t) => String(t).toUpperCase()));
+  return parsed
+    .filter((x) => x && x.ticker && x.name)
+    .map((x) => ({
+      ticker: String(x.ticker).trim().toUpperCase(),
+      name: String(x.name).trim(),
+      currency: String(x.currency || 'USD').trim().toUpperCase(),
+      thesis: String(x.thesis || '').trim().slice(0, 120),
+    }))
+    .filter((x) => !skip.has(x.ticker));
+}
+
+const TRENDING_CACHE_KEY = 'trendingApewisdomCache';
+const TRENDING_TTL_MS = 60 * 60 * 1000;
+
+async function fetchTrendingApewisdom({ force = false } = {}) {
+  const cached = await storage.get(TRENDING_CACHE_KEY);
+  if (!force && cached && Date.now() - cached.ts < TRENDING_TTL_MS) {
+    return cached.data;
+  }
+  const url = 'https://apewisdom.io/api/v1.0/filter/wallstreetbets/page/1';
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`apewisdom ${r.status}`);
+  const d = await r.json();
+  const top = (d?.results || []).slice(0, 5).map((x) => ({
+    ticker: String(x.ticker || '').toUpperCase(),
+    name: x.name || x.ticker,
+    mentions: Number(x.mentions) || 0,
+    mentions24h: Number(x.mentions_24h_ago) || 0,
+    rank: Number(x.rank) || null,
+    rankPrev: Number(x.rank_24h_ago) || null,
+  }));
+  await storage.set(TRENDING_CACHE_KEY, { ts: Date.now(), data: top });
+  return top;
+}
+
+/* =========================================================
+   Google Apps Script Sync
+   ========================================================= */
+
+async function gasPush(url, payload) {
+  if (!url) throw new Error('Apps-Script-URL fehlt.');
+  const r = await fetch(url, {
+    method: 'POST',
+    body: JSON.stringify({ action: 'push', ...payload }),
+  });
+  if (!r.ok) throw new Error(`Push ${r.status}`);
+  const d = await r.json();
+  if (d?.ok !== true) throw new Error(d?.error || 'Push fehlgeschlagen.');
+  return d;
+}
+
+async function gasPull(url) {
+  if (!url) throw new Error('Apps-Script-URL fehlt.');
+  const r = await fetch(url, {
+    method: 'POST',
+    body: JSON.stringify({ action: 'pull' }),
+  });
+  if (!r.ok) throw new Error(`Pull ${r.status}`);
+  const d = await r.json();
+  if (d?.ok !== true) throw new Error(d?.error || 'Pull fehlgeschlagen.');
+  return d.data || {};
+}
+
+/* =========================================================
    Helpers
    ========================================================= */
 
@@ -628,7 +725,7 @@ const GhostBtn = ({ children, onClick, className = '' }) => (
    Dashboard Tab
    ========================================================= */
 
-function Dashboard({ portfolio, fx, onAssess }) {
+function Dashboard({ portfolio, fx, onAssess, onOpenPosition }) {
   const computed = useMemo(
     () => portfolio.map((p) => computePosition(p, fx)),
     [portfolio, fx]
@@ -746,15 +843,22 @@ function Dashboard({ portfolio, fx, onAssess }) {
           <TrendingUp className="w-4 h-4 text-green-400" />
           Top-3 Gewinner
         </h3>
-        <div className="space-y-2">
+        <div className="space-y-1">
           {winners.map((p) => (
-            <div key={p.id} className="flex items-center justify-between">
+            <button
+              key={p.id}
+              onClick={() => onOpenPosition?.(p.id)}
+              className="w-full flex items-center justify-between gap-2 py-1.5 px-1 rounded-lg hover:bg-neutral-800/60 active:bg-neutral-800 transition text-left"
+            >
               <div className="min-w-0">
                 <p className="text-white text-sm truncate">{p.name}</p>
                 <p className="text-neutral-500 text-xs">{p.ticker}</p>
               </div>
-              <PerfText value={p.plPct} />
-            </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <PerfText value={p.plPct} />
+                <ChevronRight className="w-4 h-4 text-neutral-600" />
+              </div>
+            </button>
           ))}
         </div>
       </Card>
@@ -764,15 +868,22 @@ function Dashboard({ portfolio, fx, onAssess }) {
           <TrendingDown className="w-4 h-4 text-red-400" />
           Top-3 Verlierer
         </h3>
-        <div className="space-y-2">
+        <div className="space-y-1">
           {losers.map((p) => (
-            <div key={p.id} className="flex items-center justify-between">
+            <button
+              key={p.id}
+              onClick={() => onOpenPosition?.(p.id)}
+              className="w-full flex items-center justify-between gap-2 py-1.5 px-1 rounded-lg hover:bg-neutral-800/60 active:bg-neutral-800 transition text-left"
+            >
               <div className="min-w-0">
                 <p className="text-white text-sm truncate">{p.name}</p>
                 <p className="text-neutral-500 text-xs">{p.ticker}</p>
               </div>
-              <PerfText value={p.plPct} />
-            </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <PerfText value={p.plPct} />
+                <ChevronRight className="w-4 h-4 text-neutral-600" />
+              </div>
+            </button>
           ))}
         </div>
       </Card>
@@ -1104,12 +1215,35 @@ function DueDiligenceEditor({ position, onUpdate, apiKey }) {
    Position-Detail-Modal
    ========================================================= */
 
-function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onLogTrade, apiKey }) {
+function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onLogTrade, apiKey, onUpdateWithCascade, onAskCoach }) {
   const [stopLoss, setStopLoss] = useState(position.stopLoss ?? '');
   const [sellShares, setSellShares] = useState('');
   const [sellPrice, setSellPrice] = useState('');
   const [sellNote, setSellNote] = useState('');
   const [sellFee, setSellFee] = useState('');
+  const [sellManualOpen, setSellManualOpen] = useState(false);
+
+  // Stammdaten-Edit (collapsed by default)
+  const [editOpen, setEditOpen] = useState(false);
+  const [edit, setEdit] = useState({
+    ticker: position.ticker,
+    name: position.name,
+    assetClass: position.assetClass,
+    currency: position.currency,
+    purchaseDate: position.purchaseDate || '',
+    shares: String(position.shares),
+    costBasis: String(position.costBasis),
+  });
+  const [editError, setEditError] = useState('');
+
+  // Nachkauf
+  const [addOpen, setAddOpen] = useState(false);
+  const [addShares, setAddShares] = useState('');
+  const [addPrice, setAddPrice] = useState('');
+  const [addDate, setAddDate] = useState(new Date().toISOString().slice(0, 10));
+  const [addFee, setAddFee] = useState('');
+  const [addLogTrade, setAddLogTrade] = useState(false);
+  const [addError, setAddError] = useState('');
 
   const p = computePosition(position, fx);
   const positionTrades = trades.filter((t) => t.ticker === position.ticker);
@@ -1119,6 +1253,85 @@ function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onL
       ...position,
       stopLoss: stopLoss === '' || stopLoss == null ? null : parseFloat(stopLoss),
     });
+  };
+
+  const saveEdit = () => {
+    setEditError('');
+    const newTicker = String(edit.ticker || '').trim().toUpperCase();
+    const newShares = parseFloat(edit.shares);
+    const newCost = parseFloat(edit.costBasis);
+    if (!newTicker) return setEditError('Ticker fehlt.');
+    if (!edit.name.trim()) return setEditError('Name fehlt.');
+    if (!Number.isFinite(newShares) || newShares < 0) return setEditError('Anzahl ungültig.');
+    if (!Number.isFinite(newCost) || newCost < 0) return setEditError('Einstand ungültig.');
+    if (newShares === 0) {
+      if (!confirm(`Anzahl = 0 → Position ${position.name} löschen?`)) return;
+      onDelete(position.id);
+      onClose();
+      return;
+    }
+    const next = {
+      ...position,
+      ticker: newTicker,
+      name: edit.name.trim(),
+      assetClass: edit.assetClass,
+      currency: edit.currency,
+      purchaseDate: edit.purchaseDate,
+      shares: newShares,
+      costBasis: newCost,
+    };
+    if (newTicker !== position.ticker || edit.currency !== position.currency) {
+      try { quoteCache.delete(normalizeTicker(position.ticker)); } catch {}
+    }
+    if (onUpdateWithCascade && newTicker !== position.ticker) {
+      onUpdateWithCascade(next, position.ticker);
+    } else {
+      onUpdate(next);
+    }
+    setEditOpen(false);
+  };
+
+  const submitAddPosition = () => {
+    setAddError('');
+    const sh = parseFloat(addShares);
+    const pr = parseFloat(addPrice);
+    if (!Number.isFinite(sh) || sh <= 0) return setAddError('Anzahl ungültig.');
+    if (!Number.isFinite(pr) || pr <= 0) return setAddError('Kurs ungültig.');
+    const newShares = position.shares + sh;
+    const totalCost = position.shares * position.costBasis + sh * pr;
+    const newCost = totalCost / newShares;
+    const updated = { ...position, shares: newShares, costBasis: newCost };
+    const ddNow = ensureDD(updated);
+    updated.dueDiligence = appendDDHistory(ddNow, {
+      ts: Date.now(),
+      source: 'manual',
+      summary: `+${sh} ${position.ticker} @ ${pr} ${position.currency}`,
+      model: '',
+    });
+    onUpdate(updated);
+    if (addLogTrade) {
+      onLogTrade({
+        id: uid(),
+        date: addDate,
+        side: 'buy',
+        ticker: position.ticker,
+        name: position.name,
+        shares: sh,
+        price: pr,
+        currency: position.currency,
+        fee: parseFloat(addFee) || 0,
+        note: 'Nachkauf',
+      });
+    }
+    setAddShares(''); setAddPrice(''); setAddFee('');
+    setAddOpen(false);
+  };
+
+  const askCoachSell = () => {
+    if (!onAskCoach) return;
+    const prompt = `Soll ich meine Position in ${position.name} (${position.ticker}) verkaufen? Ich halte ${position.shares} Stück, Einstand ${position.costBasis} ${position.currency}, aktueller Kurs ${position.currentPrice} ${position.currency} (${p.plPct.toFixed(1)}% P/L). Bitte berücksichtige aktuelle Bewertung, Risiken, Catalysts und mache eine klare Empfehlung (halten / teilverkauf / komplett verkaufen).`;
+    onAskCoach(prompt);
+    onClose();
   };
 
   const sell = () => {
@@ -1150,40 +1363,125 @@ function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onL
     <Modal open={true} onClose={onClose} title={position.name}>
       <div className="space-y-4">
         <Card className="p-4">
-          <div className="grid grid-cols-2 gap-3 text-sm">
-            <div>
-              <p className="text-neutral-500 text-xs">Ticker</p>
-              <p className="text-white">{position.ticker}</p>
-            </div>
-            <div>
-              <p className="text-neutral-500 text-xs">Asset-Klasse</p>
-              <p className="text-white">{position.assetClass}</p>
-            </div>
-            <div>
-              <p className="text-neutral-500 text-xs">Anzahl</p>
-              <p className="text-white">{position.shares}</p>
-            </div>
-            <div>
-              <p className="text-neutral-500 text-xs">Währung</p>
-              <p className="text-white">{position.currency}</p>
-            </div>
-            <div>
-              <p className="text-neutral-500 text-xs">Einstand</p>
-              <p className="text-white">{fmtCcy(position.costBasis, position.currency)}</p>
-            </div>
-            <div>
-              <p className="text-neutral-500 text-xs">Aktueller Kurs</p>
-              <p className="text-white">{fmtCcy(position.currentPrice, position.currency)}</p>
-            </div>
-            <div>
-              <p className="text-neutral-500 text-xs">Marktwert</p>
-              <p className="text-white">{fmtCHF(p.mvCHF)}</p>
-            </div>
-            <div>
-              <p className="text-neutral-500 text-xs">P/L</p>
-              <PerfText value={p.plPct} />
-            </div>
+          <div className="flex items-center justify-between mb-2">
+            <h4 className="text-white font-semibold text-sm">Stammdaten</h4>
+            <button
+              onClick={() => setEditOpen((x) => !x)}
+              className="flex items-center gap-1 text-xs text-orange-400 hover:text-orange-300"
+            >
+              <Pencil className="w-3.5 h-3.5" /> {editOpen ? 'Schliessen' : 'Bearbeiten'}
+            </button>
           </div>
+          {!editOpen ? (
+            <div className="grid grid-cols-2 gap-3 text-sm">
+              <div>
+                <p className="text-neutral-500 text-xs">Ticker</p>
+                <p className="text-white">{position.ticker}</p>
+              </div>
+              <div>
+                <p className="text-neutral-500 text-xs">Asset-Klasse</p>
+                <p className="text-white">{position.assetClass}</p>
+              </div>
+              <div>
+                <p className="text-neutral-500 text-xs">Anzahl</p>
+                <p className="text-white">{position.shares}</p>
+              </div>
+              <div>
+                <p className="text-neutral-500 text-xs">Währung</p>
+                <p className="text-white">{position.currency}</p>
+              </div>
+              <div>
+                <p className="text-neutral-500 text-xs">Einstand</p>
+                <p className="text-white">{fmtCcy(position.costBasis, position.currency)}</p>
+              </div>
+              <div>
+                <p className="text-neutral-500 text-xs">Aktueller Kurs</p>
+                <p className="text-white">{fmtCcy(position.currentPrice, position.currency)}</p>
+              </div>
+              <div>
+                <p className="text-neutral-500 text-xs">Marktwert</p>
+                <p className="text-white">{fmtCHF(p.mvCHF)}</p>
+              </div>
+              <div>
+                <p className="text-neutral-500 text-xs">P/L</p>
+                <PerfText value={p.plPct} />
+              </div>
+            </div>
+          ) : (
+            <div>
+              <div className="grid grid-cols-2 gap-3">
+                <TextField label="Ticker" value={edit.ticker} onChange={(v) => setEdit({ ...edit, ticker: v })} placeholder="NOVN.SW" />
+                <SelectField label="Asset-Klasse" value={edit.assetClass} onChange={(v) => setEdit({ ...edit, assetClass: v })} options={ASSET_CLASSES} />
+              </div>
+              <TextField label="Name" value={edit.name} onChange={(v) => setEdit({ ...edit, name: v })} />
+              <div className="grid grid-cols-2 gap-3">
+                <SelectField label="Währung" value={edit.currency} onChange={(v) => setEdit({ ...edit, currency: v })} options={CURRENCIES} />
+                <TextField label="Kaufdatum" type="date" value={edit.purchaseDate} onChange={(v) => setEdit({ ...edit, purchaseDate: v })} />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <TextField label="Anzahl" type="number" step="0.0001" value={edit.shares} onChange={(v) => setEdit({ ...edit, shares: v })} />
+                <TextField label={`Einstand (${edit.currency})`} type="number" step="0.01" value={edit.costBasis} onChange={(v) => setEdit({ ...edit, costBasis: v })} />
+              </div>
+              {edit.ticker.trim().toUpperCase() !== position.ticker && (
+                <p className="text-[11px] text-orange-300 mb-2">Ticker ändert sich → bestehende Trades werden mitgeführt, Kurs wird beim nächsten Refresh neu geholt.</p>
+              )}
+              {edit.currency !== position.currency && (
+                <p className="text-[11px] text-orange-300 mb-2">Währung ändert sich → Kurs in neuer Währung wird beim nächsten Refresh geholt.</p>
+              )}
+              {editError && (
+                <div className="mb-2 text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
+                  <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {editError}
+                </div>
+              )}
+              <PrimaryBtn onClick={saveEdit}>Stammdaten speichern</PrimaryBtn>
+            </div>
+          )}
+        </Card>
+
+        <Card className="p-4">
+          <div className="flex items-center justify-between mb-2">
+            <h4 className="text-white font-semibold text-sm">Nachkauf</h4>
+            <button
+              onClick={() => setAddOpen((x) => !x)}
+              className="flex items-center gap-1 text-xs text-orange-400 hover:text-orange-300"
+            >
+              <Plus className="w-3.5 h-3.5" /> {addOpen ? 'Schliessen' : 'Hinzufügen'}
+            </button>
+          </div>
+          {!addOpen ? (
+            <p className="text-neutral-500 text-xs">Position aufstocken → Anzahl und Cost-Basis werden anteilig neu berechnet.</p>
+          ) : (
+            <div>
+              <div className="grid grid-cols-2 gap-3">
+                <TextField label="Anzahl" type="number" step="0.0001" value={addShares} onChange={setAddShares} />
+                <TextField label={`Kurs (${position.currency})`} type="number" step="0.01" value={addPrice} onChange={setAddPrice} />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <TextField label="Datum" type="date" value={addDate} onChange={setAddDate} />
+                <TextField label="Gebühren" type="number" step="0.01" value={addFee} onChange={setAddFee} />
+              </div>
+              <label className="flex items-center gap-2 text-xs text-neutral-400 mb-3 select-none">
+                <input
+                  type="checkbox"
+                  checked={addLogTrade}
+                  onChange={(e) => setAddLogTrade(e.target.checked)}
+                  className="accent-orange-500"
+                />
+                Auch als Trade loggen (optional)
+              </label>
+              {addShares && addPrice && (
+                <p className="text-[11px] text-neutral-400 mb-2">
+                  Neue Position: {(position.shares + parseFloat(addShares || 0)).toFixed(2)} Stück, Cost-Basis {(((position.shares * position.costBasis) + (parseFloat(addShares || 0) * parseFloat(addPrice || 0))) / (position.shares + parseFloat(addShares || 0))).toFixed(2)} {position.currency}
+                </p>
+              )}
+              {addError && (
+                <div className="mb-2 text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
+                  <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {addError}
+                </div>
+              )}
+              <PrimaryBtn onClick={submitAddPosition} disabled={!addShares || !addPrice}>Nachkauf eintragen</PrimaryBtn>
+            </div>
+          )}
         </Card>
 
         <Card className="p-4">
@@ -1211,16 +1509,33 @@ function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onL
         <DueDiligenceEditor position={position} onUpdate={onUpdate} apiKey={apiKey} />
 
         <Card className="p-4">
-          <h4 className="text-white font-semibold mb-2">Verkauf loggen</h4>
-          <div className="grid grid-cols-2 gap-3">
-            <TextField label="Anzahl" type="number" value={sellShares} onChange={setSellShares} />
-            <TextField label={`Preis (${position.currency})`} type="number" step="0.01" value={sellPrice} onChange={setSellPrice} />
-          </div>
-          <TextField label="Gebühren" type="number" step="0.01" value={sellFee} onChange={setSellFee} />
-          <TextArea label="Notiz" value={sellNote} onChange={setSellNote} placeholder="Warum verkaufst du?" rows={2} />
-          <PrimaryBtn onClick={sell} disabled={!sellShares || !sellPrice}>
-            Verkauf eintragen
+          <h4 className="text-white font-semibold mb-2">Verkauf-Check</h4>
+          <p className="text-neutral-400 text-xs mb-3">
+            Lass den Coach analysieren, ob ein (Teil-)Verkauf gerade Sinn macht – Bewertung, Risiken, Catalysts.
+          </p>
+          <PrimaryBtn onClick={askCoachSell} disabled={!onAskCoach}>
+            Coach: soll ich verkaufen?
           </PrimaryBtn>
+          <button
+            onClick={() => setSellManualOpen((x) => !x)}
+            className="mt-3 flex items-center gap-1 text-xs text-neutral-400 hover:text-neutral-200"
+          >
+            <ChevronRight className={`w-3.5 h-3.5 transition-transform ${sellManualOpen ? 'rotate-90' : ''}`} />
+            Verkauf manuell eintragen
+          </button>
+          {sellManualOpen && (
+            <div className="mt-3">
+              <div className="grid grid-cols-2 gap-3">
+                <TextField label="Anzahl" type="number" value={sellShares} onChange={setSellShares} />
+                <TextField label={`Preis (${position.currency})`} type="number" step="0.01" value={sellPrice} onChange={setSellPrice} />
+              </div>
+              <TextField label="Gebühren" type="number" step="0.01" value={sellFee} onChange={setSellFee} />
+              <TextArea label="Notiz" value={sellNote} onChange={setSellNote} placeholder="Warum verkaufst du?" rows={2} />
+              <PrimaryBtn onClick={sell} disabled={!sellShares || !sellPrice}>
+                Verkauf eintragen
+              </PrimaryBtn>
+            </div>
+          )}
         </Card>
 
         {positionTrades.length > 0 && (
@@ -1613,30 +1928,43 @@ function AddTradeModal({ open, onClose, onAdd, portfolio }) {
    Watchlist Tab
    ========================================================= */
 
-function WatchlistTab({ watchlist, onAdd, onRemove, onConvert }) {
+function WatchlistTab({ watchlist, portfolio, onAdd, onAddMany, onRemove, onUpdate, onConvert, apiKey, onAskCoach }) {
   const [showAdd, setShowAdd] = useState(false);
   const [convertItem, setConvertItem] = useState(null);
+  const [ddItem, setDdItem] = useState(null);
 
   return (
     <div className="px-4 pb-28 pt-4 space-y-3">
+      <TrendingCard onAddWatchlist={onAdd} watchlist={watchlist} onAskCoach={onAskCoach} />
+
+      <WatchlistGeneratorCard
+        portfolio={portfolio}
+        watchlist={watchlist}
+        apiKey={apiKey}
+        onAddMany={onAddMany}
+      />
+
       <button
         onClick={() => setShowAdd(true)}
         className="w-full bg-orange-500 text-black font-semibold py-3 rounded-xl flex items-center justify-center gap-2"
       >
-        <Plus className="w-4 h-4" /> Hinzufügen
+        <Plus className="w-4 h-4" /> Manuell hinzufügen
       </button>
 
       {watchlist.map((w) => (
         <Card key={w.id} className="p-4">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <p className="text-white font-semibold">{w.name}</p>
                 <Pill color={w.source === 'ai' ? 'accent' : 'blue'}>
                   {w.source === 'ai' ? 'vom AI' : 'von mir'}
                 </Pill>
+                {w.dueDiligence?.lastAnalyzedAt && (
+                  <Pill color="green">DD ✓</Pill>
+                )}
               </div>
-              <p className="text-neutral-500 text-xs mt-0.5">{w.ticker}</p>
+              <p className="text-neutral-500 text-xs mt-0.5">{w.ticker} · {w.currency}</p>
               {w.triggerPrice != null && (
                 <p className="text-neutral-300 text-sm mt-1">
                   Trigger: {fmtCcy(w.triggerPrice, w.currency)}
@@ -1646,14 +1974,20 @@ function WatchlistTab({ watchlist, onAdd, onRemove, onConvert }) {
                 <p className="text-neutral-400 text-sm mt-1 italic">„{w.thesis}"</p>
               )}
             </div>
-            <div className="flex flex-col gap-2 shrink-0">
+            <div className="flex flex-col gap-1.5 shrink-0">
               <button
                 onClick={() => setConvertItem(w)}
-                className="bg-orange-500/20 text-orange-400 px-2 py-1 rounded-lg text-xs font-medium"
+                className="bg-orange-500/20 text-orange-400 px-2.5 py-1 rounded-lg text-xs font-medium"
               >
                 Kaufen
               </button>
-              <button onClick={() => onRemove(w.id)}>
+              <button
+                onClick={() => setDdItem(w)}
+                className="bg-blue-500/20 text-blue-400 px-2.5 py-1 rounded-lg text-xs font-medium flex items-center justify-center gap-1"
+              >
+                <Microscope className="w-3 h-3" /> DD
+              </button>
+              <button onClick={() => onRemove(w.id)} className="p-1 self-center">
                 <Trash2 className="w-4 h-4 text-neutral-500 hover:text-red-400" />
               </button>
             </div>
@@ -1678,7 +2012,278 @@ function WatchlistTab({ watchlist, onAdd, onRemove, onConvert }) {
           }}
         />
       )}
+      {ddItem && (
+        <WatchlistDDModal
+          item={ddItem}
+          apiKey={apiKey}
+          onClose={() => setDdItem(null)}
+          onUpdate={(updated) => onUpdate(updated)}
+        />
+      )}
     </div>
+  );
+}
+
+function TrendingCard({ onAddWatchlist, watchlist, onAskCoach }) {
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState('');
+  const [ts, setTs] = useState(null);
+
+  const load = async (force = false) => {
+    setLoading(true);
+    setErr('');
+    try {
+      const d = await fetchTrendingApewisdom({ force });
+      setData(d);
+      const cached = await storage.get(TRENDING_CACHE_KEY);
+      setTs(cached?.ts || Date.now());
+    } catch (e) {
+      setErr('Trending nicht erreichbar');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(false); }, []);
+
+  const ago = ts ? Math.max(0, Math.round((Date.now() - ts) / 60000)) : null;
+  const onWatchlist = new Set(watchlist.map((w) => w.ticker.toUpperCase()));
+
+  return (
+    <Card className="p-4">
+      <div className="flex items-center justify-between mb-2">
+        <h4 className="text-white font-semibold flex items-center gap-1.5 text-sm">
+          <Flame className="w-4 h-4 text-orange-400" /> Trending r/wallstreetbets
+        </h4>
+        <button onClick={() => load(true)} disabled={loading} className="text-neutral-400 hover:text-white disabled:opacity-40">
+          {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+        </button>
+      </div>
+      {err && <p className="text-neutral-500 text-xs italic">{err} – App funktioniert weiter.</p>}
+      {!err && data.length === 0 && !loading && (
+        <p className="text-neutral-500 text-xs">Noch keine Daten.</p>
+      )}
+      <div className="space-y-1.5">
+        {data.map((t) => {
+          const already = onWatchlist.has(t.ticker);
+          const rankDelta = t.rankPrev != null && t.rank != null ? t.rankPrev - t.rank : null;
+          return (
+            <div key={t.ticker} className="flex items-center justify-between gap-2 py-1">
+              <div className="min-w-0 flex-1">
+                <p className="text-white text-sm font-medium truncate">
+                  {t.ticker} <span className="text-neutral-500 font-normal">· {t.name}</span>
+                </p>
+                <p className="text-[11px] text-neutral-500">
+                  {t.mentions} Mentions
+                  {rankDelta != null && rankDelta !== 0 && (
+                    <span className={rankDelta > 0 ? 'text-green-400 ml-1' : 'text-red-400 ml-1'}>
+                      {rankDelta > 0 ? `↑${rankDelta}` : `↓${-rankDelta}`}
+                    </span>
+                  )}
+                </p>
+              </div>
+              <div className="flex gap-1 shrink-0">
+                <button
+                  onClick={() => {
+                    if (already) return;
+                    onAddWatchlist({
+                      id: uid(),
+                      ticker: t.ticker,
+                      name: t.name,
+                      triggerPrice: null,
+                      currency: 'USD',
+                      thesis: 'Trending in r/wallstreetbets',
+                      source: 'ai',
+                      addedAt: new Date().toISOString(),
+                    });
+                  }}
+                  disabled={already}
+                  className="bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 text-white p-1.5 rounded-lg"
+                  title={already ? 'Schon auf Watchlist' : 'Auf Watchlist'}
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  onClick={() => onAskCoach?.(`Was sagst du zu ${t.ticker} (${t.name})? Aktuelle Lage, Bewertung, Risiken. Es ist gerade trending in r/wallstreetbets mit ${t.mentions} Mentions – ist das ein Signal oder Noise?`)}
+                  className="bg-orange-500/20 hover:bg-orange-500/30 text-orange-400 p-1.5 rounded-lg"
+                  title="Coach analysieren"
+                >
+                  <MessageCircle className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {ago != null && (
+        <p className="text-[10px] text-neutral-600 mt-2">
+          Aktualisiert {ago === 0 ? 'gerade' : `vor ${ago} Min`} · apewisdom.io
+        </p>
+      )}
+    </Card>
+  );
+}
+
+function WatchlistGeneratorCard({ portfolio, watchlist, apiKey, onAddMany }) {
+  const [theme, setTheme] = useState('');
+  const [count, setCount] = useState(5);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState('');
+  const [open, setOpen] = useState(false);
+
+  const generate = async () => {
+    if (!theme.trim()) return;
+    setLoading(true);
+    setErr('');
+    try {
+      const exclude = [
+        ...portfolio.map((p) => p.ticker.toUpperCase()),
+        ...watchlist.map((w) => w.ticker.toUpperCase()),
+      ];
+      const items = await generateWatchlistFromTheme({
+        theme: theme.trim(),
+        count,
+        excludeTickers: exclude,
+        apiKey,
+      });
+      if (items.length === 0) {
+        setErr('Keine neuen Vorschläge (alle bereits bekannt?).');
+      } else {
+        onAddMany(items.map((x) => ({
+          id: uid(),
+          ticker: x.ticker,
+          name: x.name,
+          triggerPrice: null,
+          currency: x.currency,
+          thesis: x.thesis,
+          source: 'ai',
+          addedAt: new Date().toISOString(),
+          dueDiligence: { ...emptyDD(), thesis: x.thesis },
+        })));
+        setTheme('');
+      }
+    } catch (e) {
+      setErr(e.message || 'Generieren fehlgeschlagen.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Card className="p-4">
+      <div className="flex items-center justify-between mb-2">
+        <h4 className="text-white font-semibold flex items-center gap-1.5 text-sm">
+          <Sparkles className="w-4 h-4 text-orange-400" /> AI-Watchlist generieren
+        </h4>
+        <button
+          onClick={() => setOpen((x) => !x)}
+          className="text-xs text-orange-400 hover:text-orange-300 flex items-center gap-1"
+        >
+          <ChevronRight className={`w-3.5 h-3.5 transition-transform ${open ? 'rotate-90' : ''}`} />
+          {open ? 'Schliessen' : 'Öffnen'}
+        </button>
+      </div>
+      {!open ? (
+        <p className="text-neutral-500 text-xs">Themen-Investments mit Due Diligence per AI vorschlagen lassen.</p>
+      ) : (
+        <div>
+          <TextField
+            label="Thema / These"
+            value={theme}
+            onChange={setTheme}
+            placeholder="z.B. Picks & Shovels AI-Welle 3, Defensive CH-Dividenden"
+          />
+          <div className="mb-3">
+            <label className="block text-xs font-medium text-neutral-400 mb-1">Anzahl: {count}</label>
+            <input
+              type="range"
+              min="3"
+              max="8"
+              value={count}
+              onChange={(e) => setCount(parseInt(e.target.value, 10))}
+              className="w-full accent-orange-500"
+            />
+          </div>
+          {err && (
+            <div className="mb-2 text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {err}
+            </div>
+          )}
+          <PrimaryBtn onClick={generate} disabled={loading || !theme.trim() || !apiKey}>
+            {loading ? <span className="flex items-center justify-center gap-2"><Spinner size={4} /> Generiere…</span> : 'Generieren'}
+          </PrimaryBtn>
+          {!apiKey && (
+            <p className="text-[11px] text-orange-300 mt-2">Anthropic API-Key in Einstellungen nötig.</p>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function WatchlistDDModal({ item, apiKey, onClose, onUpdate }) {
+  const [dd, setDd] = useState(() => ensureDD({ dueDiligence: item.dueDiligence, note: item.thesis }));
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState('');
+  const setField = (k, v) => setDd((d) => ({ ...d, [k]: v }));
+
+  const runDeep = async () => {
+    setLoading(true);
+    setErr('');
+    try {
+      const pseudoPosition = {
+        ticker: item.ticker,
+        name: item.name,
+        assetClass: 'Sonstige',
+        currency: item.currency,
+        costBasis: item.triggerPrice || 0,
+        currentPrice: item.triggerPrice || 0,
+        dueDiligence: dd,
+      };
+      const next = await analyzePositionDeep(pseudoPosition, { apiKey });
+      setDd({ ...next, userNotes: dd.userNotes, tags: dd.tags });
+    } catch (e) {
+      setErr(e.message || 'Deep-Analyse fehlgeschlagen.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const save = () => {
+    onUpdate({ ...item, dueDiligence: dd, thesis: dd.thesis || item.thesis || '' });
+    onClose();
+  };
+
+  return (
+    <Modal open={true} onClose={onClose} title={`DD: ${item.name}`}>
+      <Card className="p-4">
+        <div className="flex items-start justify-between mb-3 gap-2">
+          <p className="text-xs text-neutral-500">{item.ticker} · {item.currency}</p>
+          <button
+            onClick={runDeep}
+            disabled={loading || !apiKey}
+            title={!apiKey ? 'Anthropic API-Key in Einstellungen' : ''}
+            className="flex items-center gap-1.5 bg-orange-500/15 hover:bg-orange-500/25 disabled:opacity-40 text-orange-400 px-3 py-1.5 rounded-lg text-xs font-medium transition shrink-0"
+          >
+            {loading ? <Spinner size={3} /> : <Sparkles className="w-3.5 h-3.5" />}
+            {loading ? 'Analysiere…' : 'Tief analysieren'}
+          </button>
+        </div>
+        {err && (
+          <div className="mb-3 text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
+            <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {err}
+          </div>
+        )}
+        <TextArea label="Thesis" value={dd.thesis} onChange={(v) => setField('thesis', v)} rows={2} placeholder="Warum interessant?" />
+        <BulletEditor label="Stärken" items={dd.strengths} onChange={(v) => setField('strengths', v)} accent="green" />
+        <BulletEditor label="Risiken" items={dd.risks} onChange={(v) => setField('risks', v)} accent="red" />
+        <BulletEditor label="Catalysts" items={dd.catalysts} onChange={(v) => setField('catalysts', v)} accent="orange" />
+        <TextArea label="Fundamentals" value={dd.fundamentals} onChange={(v) => setField('fundamentals', v)} placeholder="P/E, Margen, Verschuldung…" rows={3} />
+        <TextArea label="Eigene Notizen" value={dd.userNotes} onChange={(v) => setField('userNotes', v)} rows={2} />
+        <PrimaryBtn onClick={save}>DD speichern</PrimaryBtn>
+      </Card>
+    </Modal>
   );
 }
 
@@ -1733,6 +2338,9 @@ function ConvertToPositionModal({ item, onClose, onConfirm }) {
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
   const submit = () => {
     if (!form.shares || !form.costBasis) return;
+    const inheritedDD = item.dueDiligence
+      ? ensureDD({ dueDiligence: item.dueDiligence })
+      : { ...emptyDD(), thesis: item.thesis || '' };
     onConfirm({
       id: uid(),
       ticker: item.ticker,
@@ -1743,8 +2351,9 @@ function ConvertToPositionModal({ item, onClose, onConfirm }) {
       currentPrice: parseFloat(form.currentPrice) || parseFloat(form.costBasis),
       currency: item.currency,
       purchaseDate: form.purchaseDate,
-      note: item.thesis,
+      note: item.thesis || inheritedDD.thesis || '',
       stopLoss: null,
+      dueDiligence: inheritedDD,
     });
   };
   return (
@@ -1768,7 +2377,7 @@ function ConvertToPositionModal({ item, onClose, onConfirm }) {
    Coach (AI Chat) Tab
    ========================================================= */
 
-function CoachTab({ portfolio, trades, watchlist, fx, apiKey, chatHistory, setChatHistory, onAddWatchlistFromAI, onApplyDDUpdate, assessmentTrigger, onAssessmentDone }) {
+function CoachTab({ portfolio, trades, watchlist, fx, apiKey, chatHistory, setChatHistory, onAddWatchlistFromAI, onApplyDDUpdate, assessmentTrigger, onAssessmentDone, pendingQuestion, onPendingQuestionConsumed }) {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
@@ -1881,6 +2490,15 @@ ${JSON.stringify(watchlist)}`;
     }
     // eslint-disable-next-line
   }, [assessmentTrigger]);
+
+  // Pending-Question vom App-State (z.B. "soll ich X verkaufen?", "was sagst du zu Y?")
+  useEffect(() => {
+    if (pendingQuestion && pendingQuestion.text) {
+      send(pendingQuestion.text);
+      onPendingQuestionConsumed?.();
+    }
+    // eslint-disable-next-line
+  }, [pendingQuestion?.id]);
 
   const parseSuggestions = (text) => {
     const re = /\[WATCHLIST_VORSCHLAG:\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^\]]+?)\s*\]/g;
@@ -2147,6 +2765,90 @@ function SuggestionCard({ suggestion, onAccept }) {
 }
 
 /* =========================================================
+   Apps-Script-Quelltext (in Sheet → Apps Script einfügen)
+   ========================================================= */
+
+const APPS_SCRIPT_SOURCE = `// AI-Berater – Google-Sheets-Sync
+// Bereitstellen: Web-App, ausführen als ICH, Zugriff JEDER (mit Link)
+const TABS = { portfolio: 'Portfolio', trades: 'Trades', watchlist: 'Watchlist' };
+const SCHEMA = {
+  portfolio: ['id','ticker','name','assetClass','shares','costBasis','currentPrice','currency','purchaseDate','note','stopLoss','lastQuoteAt','quoteSource','dueDiligence'],
+  trades: ['id','date','side','ticker','name','shares','price','currency','fee','note'],
+  watchlist: ['id','ticker','name','triggerPrice','currency','thesis','source','addedAt','dueDiligence'],
+};
+
+function doPost(e) {
+  try {
+    const req = JSON.parse(e.postData.contents || '{}');
+    if (req.action === 'push') return jsonResp({ ok: true, ...pushAll(req) });
+    if (req.action === 'pull') return jsonResp({ ok: true, data: pullAll() });
+    return jsonResp({ ok: false, error: 'Unknown action' });
+  } catch (err) {
+    return jsonResp({ ok: false, error: String(err) });
+  }
+}
+
+function jsonResp(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function pushAll(req) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ['portfolio','trades','watchlist'].forEach((k) => {
+    const tabName = TABS[k];
+    const rows = Array.isArray(req[k]) ? req[k] : [];
+    let sh = ss.getSheetByName(tabName);
+    if (!sh) sh = ss.insertSheet(tabName);
+    sh.clear();
+    const cols = SCHEMA[k];
+    const data = [cols].concat(rows.map((r) => cols.map((c) => {
+      const v = r[c];
+      if (c === 'dueDiligence') return v ? JSON.stringify(v) : '';
+      if (v == null) return '';
+      return v;
+    })));
+    sh.getRange(1, 1, data.length, cols.length).setValues(data);
+  });
+  return { counts: {
+    portfolio: (req.portfolio || []).length,
+    trades: (req.trades || []).length,
+    watchlist: (req.watchlist || []).length,
+  }};
+}
+
+function pullAll() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const out = { portfolio: [], trades: [], watchlist: [] };
+  ['portfolio','trades','watchlist'].forEach((k) => {
+    const sh = ss.getSheetByName(TABS[k]);
+    if (!sh) return;
+    const vals = sh.getDataRange().getValues();
+    if (vals.length < 2) return;
+    const header = vals[0].map(String);
+    for (let i = 1; i < vals.length; i++) {
+      const row = vals[i];
+      if (!row[0]) continue;
+      const obj = {};
+      header.forEach((h, idx) => {
+        let v = row[idx];
+        if (h === 'dueDiligence' && typeof v === 'string' && v.length > 0) {
+          try { v = JSON.parse(v); } catch (e) { v = null; }
+        }
+        if (['shares','costBasis','currentPrice','stopLoss','price','fee','triggerPrice'].indexOf(h) >= 0 && v !== '' && v != null) {
+          v = Number(v);
+        }
+        obj[h] = v === '' ? null : v;
+      });
+      out[k].push(obj);
+    }
+  });
+  return out;
+}
+`;
+
+/* =========================================================
    Settings Modal
    ========================================================= */
 
@@ -2154,14 +2856,61 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset, portfoli
   const [fx, setFx] = useState(settings.fx);
   const [apiKey, setApiKey] = useState(settings.apiKey || '');
   const [finnhubKey, setFinnhubKey] = useState(settings.finnhubKey || '');
+  const [gasUrl, setGasUrl] = useState(settings.gasUrl || '');
   const [importErr, setImportErr] = useState('');
+  const [syncStatus, setSyncStatus] = useState('');
+  const [syncErr, setSyncErr] = useState('');
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [setupOpen, setSetupOpen] = useState(false);
   const fileInputRef = useRef(null);
   useEffect(() => {
     setFx(settings.fx);
     setApiKey(settings.apiKey || '');
     setFinnhubKey(settings.finnhubKey || '');
+    setGasUrl(settings.gasUrl || '');
     setImportErr('');
-  }, [settings.fx, settings.apiKey, settings.finnhubKey, open]);
+    setSyncErr('');
+    setSyncStatus('');
+  }, [settings.fx, settings.apiKey, settings.finnhubKey, settings.gasUrl, open]);
+
+  const doSyncPush = async () => {
+    setSyncBusy(true); setSyncErr(''); setSyncStatus('');
+    try {
+      const url = gasUrl.trim();
+      await gasPush(url, { portfolio, trades, watchlist });
+      setSyncStatus(`Push OK – ${new Date().toLocaleString('de-CH')}`);
+      setSettings({ ...settings, gasUrl: url, lastSheetSyncAt: Date.now(), lastSheetSyncKind: 'push' });
+    } catch (e) {
+      setSyncErr(e.message || 'Push fehlgeschlagen.');
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+  const doSyncPull = async () => {
+    if (!confirm('Pull überschreibt deine lokalen Daten (Portfolio, Trades, Watchlist). Fortfahren?')) return;
+    setSyncBusy(true); setSyncErr(''); setSyncStatus('');
+    try {
+      const url = gasUrl.trim();
+      const data = await gasPull(url);
+      onImport(data);
+      setSyncStatus(`Pull OK – ${new Date().toLocaleString('de-CH')}`);
+      setSettings({ ...settings, gasUrl: url, lastSheetSyncAt: Date.now(), lastSheetSyncKind: 'pull' });
+    } catch (e) {
+      setSyncErr(e.message || 'Pull fehlgeschlagen.');
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  const copyScript = async () => {
+    try {
+      await navigator.clipboard.writeText(APPS_SCRIPT_SOURCE);
+      setSyncStatus('Code kopiert.');
+      setTimeout(() => setSyncStatus(''), 2000);
+    } catch {
+      setSyncErr('Clipboard nicht verfügbar.');
+    }
+  };
 
   const exportData = () => {
     const payload = {
@@ -2209,6 +2958,7 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset, portfoli
       ...settings,
       apiKey: apiKey.trim(),
       finnhubKey: finnhubKey.trim(),
+      gasUrl: gasUrl.trim(),
       fx: {
         CHF: 1,
         USD: parseFloat(fx.USD) || DEFAULT_FX.USD,
@@ -2218,6 +2968,9 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset, portfoli
     });
     onClose();
   };
+
+  const lastSync = settings.lastSheetSyncAt;
+  const lastSyncAgo = lastSync ? Math.max(0, Math.round((Date.now() - lastSync) / 60000)) : null;
 
   return (
     <Modal
@@ -2246,6 +2999,58 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset, portfoli
         <TextField label="1 USD =" type="number" step="0.0001" value={fx.USD} onChange={(v) => setFx({ ...fx, USD: v })} />
         <TextField label="1 EUR =" type="number" step="0.0001" value={fx.EUR} onChange={(v) => setFx({ ...fx, EUR: v })} />
         <TextField label="1 SEK =" type="number" step="0.0001" value={fx.SEK} onChange={(v) => setFx({ ...fx, SEK: v })} />
+      </Card>
+      <Card className="p-4 mb-3">
+        <h4 className="text-white font-semibold mb-2 flex items-center gap-1.5">
+          <Cloud className="w-4 h-4 text-orange-400" /> Google-Sheets-Sync
+        </h4>
+        <p className="text-neutral-400 text-xs mb-2">
+          Multi-Device & eigene Analysen in Sheets. Push überschreibt das Sheet, Pull überschreibt lokal („Last writer wins").
+        </p>
+        <TextField label="Apps-Script Web-App URL" type="password" value={gasUrl} onChange={setGasUrl} placeholder="https://script.google.com/macros/s/.../exec" />
+        <div className="grid grid-cols-2 gap-2 mb-2">
+          <GhostBtn onClick={doSyncPush} className={syncBusy || !gasUrl ? 'opacity-50 pointer-events-none' : ''}>
+            <span className="flex items-center justify-center gap-1.5"><CloudUpload className="w-4 h-4" /> Push</span>
+          </GhostBtn>
+          <GhostBtn onClick={doSyncPull} className={syncBusy || !gasUrl ? 'opacity-50 pointer-events-none' : ''}>
+            <span className="flex items-center justify-center gap-1.5"><CloudDownload className="w-4 h-4" /> Pull</span>
+          </GhostBtn>
+        </div>
+        {syncBusy && <p className="text-orange-400 text-xs flex items-center gap-1.5"><Spinner size={3} /> Synchronisiere…</p>}
+        {syncStatus && !syncBusy && <p className="text-green-400 text-xs">{syncStatus}</p>}
+        {syncErr && (
+          <div className="mt-2 text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
+            <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {syncErr}
+          </div>
+        )}
+        {lastSync && !syncStatus && (
+          <p className="text-neutral-500 text-[11px] mt-1">
+            Letzter {settings.lastSheetSyncKind === 'pull' ? 'Pull' : 'Push'} {lastSyncAgo === 0 ? 'gerade' : `vor ${lastSyncAgo} Min`}
+          </p>
+        )}
+        <button
+          onClick={() => setSetupOpen((x) => !x)}
+          className="mt-3 flex items-center gap-1 text-xs text-neutral-400 hover:text-neutral-200"
+        >
+          <ChevronRight className={`w-3.5 h-3.5 transition-transform ${setupOpen ? 'rotate-90' : ''}`} />
+          Setup-Anleitung
+        </button>
+        {setupOpen && (
+          <div className="mt-2 text-xs text-neutral-400 space-y-2">
+            <ol className="list-decimal pl-4 space-y-1">
+              <li>Neues Google-Sheet anlegen → Erweiterungen → Apps Script.</li>
+              <li>Code unten kopieren, in <code>Code.gs</code> einfügen, speichern.</li>
+              <li>Bereitstellen → Neue Bereitstellung → Web-App → „Jeder" → URL hier oben einfügen.</li>
+              <li>Push klicken → drei Tabs erscheinen im Sheet.</li>
+            </ol>
+            <button
+              onClick={copyScript}
+              className="flex items-center gap-1.5 bg-neutral-800 hover:bg-neutral-700 text-white px-3 py-1.5 rounded-lg text-xs"
+            >
+              <Copy className="w-3.5 h-3.5" /> Apps-Script-Code kopieren
+            </button>
+          </div>
+        )}
       </Card>
       <Card className="p-4 mb-3">
         <h4 className="text-white font-semibold mb-1">Backup (Export / Import)</h4>
@@ -2398,6 +3203,7 @@ export default function App() {
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [assessmentTrigger, setAssessmentTrigger] = useState(0);
+  const [pendingCoachQuestion, setPendingCoachQuestion] = useState(null);
   const [hydrated, setHydrated] = useState(false);
 
   // Initial Load
@@ -2433,10 +3239,21 @@ export default function App() {
   // Position handlers
   const updatePosition = (pos) =>
     setPortfolio((arr) => arr.map((x) => (x.id === pos.id ? pos : x)));
+  const updatePositionWithCascade = (pos, oldTicker) => {
+    setPortfolio((arr) => arr.map((x) => (x.id === pos.id ? pos : x)));
+    if (oldTicker && oldTicker !== pos.ticker) {
+      setTrades((arr) => arr.map((t) => (t.ticker === oldTicker ? { ...t, ticker: pos.ticker } : t)));
+    }
+  };
   const deletePosition = (id) =>
     setPortfolio((arr) => arr.filter((x) => x.id !== id));
   const addPosition = (pos) => setPortfolio((arr) => [pos, ...arr]);
   const addPositions = (positions) => setPortfolio((arr) => [...positions, ...arr]);
+
+  const askCoach = (text) => {
+    setTab('coach');
+    setPendingCoachQuestion({ id: uid(), text });
+  };
 
   // DD-Updates aus dem Coach-Assessment auf eine Position anwenden.
   // update: { ticker, field, op: '+'|'-'|'=', value }
@@ -2509,6 +3326,9 @@ export default function App() {
 
   // Watchlist handlers
   const addWatchlist = (w) => setWatchlist((arr) => [w, ...arr]);
+  const addWatchlistMany = (items) => setWatchlist((arr) => [...items, ...arr]);
+  const updateWatchlist = (w) =>
+    setWatchlist((arr) => arr.map((x) => (x.id === w.id ? w : x)));
   const removeWatchlist = (id) => setWatchlist((arr) => arr.filter((x) => x.id !== id));
   const addWatchlistFromAI = (s) => {
     if (watchlist.some((w) => w.ticker === s.ticker)) return;
@@ -2577,7 +3397,12 @@ export default function App() {
         />
 
         {tab === 'dashboard' && (
-          <Dashboard portfolio={portfolio} fx={fx} onAssess={triggerAssessment} />
+          <Dashboard
+            portfolio={portfolio}
+            fx={fx}
+            onAssess={triggerAssessment}
+            onOpenPosition={(id) => setOpenPositionId(id)}
+          />
         )}
         {tab === 'portfolio' && (
           <PortfolioList
@@ -2599,9 +3424,14 @@ export default function App() {
         {tab === 'watchlist' && (
           <WatchlistTab
             watchlist={watchlist}
+            portfolio={portfolio}
+            apiKey={settings.apiKey}
             onAdd={addWatchlist}
+            onAddMany={addWatchlistMany}
             onRemove={removeWatchlist}
+            onUpdate={updateWatchlist}
             onConvert={convertWatchlist}
+            onAskCoach={askCoach}
           />
         )}
         {tab === 'coach' && (
@@ -2617,6 +3447,8 @@ export default function App() {
             onApplyDDUpdate={applyDDUpdate}
             assessmentTrigger={assessmentTrigger}
             onAssessmentDone={() => {}}
+            pendingQuestion={pendingCoachQuestion}
+            onPendingQuestionConsumed={() => setPendingCoachQuestion(null)}
           />
         )}
 
@@ -2630,8 +3462,10 @@ export default function App() {
             apiKey={settings.apiKey}
             onClose={() => setOpenPositionId(null)}
             onUpdate={updatePosition}
+            onUpdateWithCascade={updatePositionWithCascade}
             onDelete={deletePosition}
             onLogTrade={addTrade}
+            onAskCoach={askCoach}
           />
         )}
 
