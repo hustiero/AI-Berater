@@ -321,6 +321,7 @@ Wähle den passendsten Wert basierend auf ticker/name/industry. Bei Unsicherheit
   const today = new Date().toISOString().slice(0, 10);
   return merged.map((m, i) => {
     const ai = aiResult.find((x) => x.idx === i) || {};
+    const thesis = ai.thesis || '';
     return {
       id: uid(),
       ticker: m.ticker,
@@ -331,11 +332,131 @@ Wähle den passendsten Wert basierend auf ticker/name/industry. Bei Unsicherheit
       currentPrice: m.currentPrice,
       currency: m.currency,
       purchaseDate: today,
-      note: ai.thesis || '',
+      note: thesis,
       stopLoss: null,
       lastQuoteAt: m.source ? Date.now() : null,
       quoteSource: m.source,
+      dueDiligence: { ...emptyDD(), thesis },
     };
+  });
+}
+
+/* =========================================================
+   Due-Diligence Schema + Migration
+   ========================================================= */
+
+const DD_FIELDS_AI_WRITABLE = ['thesis', 'strengths', 'risks', 'catalysts', 'fundamentals'];
+const DD_LIST_FIELDS = ['strengths', 'risks', 'catalysts', 'tags'];
+const DD_TEXT_FIELDS = ['thesis', 'fundamentals', 'userNotes'];
+const DD_HISTORY_CAP = 5;
+
+function emptyDD() {
+  return {
+    thesis: '',
+    strengths: [],
+    risks: [],
+    catalysts: [],
+    fundamentals: '',
+    userNotes: '',
+    tags: [],
+    lastAnalyzedAt: null,
+    lastAnalysisModel: '',
+    history: [],
+  };
+}
+
+function ensureDD(position) {
+  if (position.dueDiligence && typeof position.dueDiligence === 'object') {
+    const d = position.dueDiligence;
+    return {
+      ...emptyDD(),
+      ...d,
+      strengths: Array.isArray(d.strengths) ? d.strengths : [],
+      risks: Array.isArray(d.risks) ? d.risks : [],
+      catalysts: Array.isArray(d.catalysts) ? d.catalysts : [],
+      tags: Array.isArray(d.tags) ? d.tags : [],
+      history: Array.isArray(d.history) ? d.history : [],
+    };
+  }
+  // Migration: alte Position ohne DD. note → thesis.
+  return { ...emptyDD(), thesis: position.note || '' };
+}
+
+function migrateDD(positions) {
+  return positions.map((p) => ({ ...p, dueDiligence: ensureDD(p) }));
+}
+
+function appendDDHistory(dd, entry) {
+  const history = [entry, ...(dd.history || [])].slice(0, DD_HISTORY_CAP);
+  return { ...dd, history };
+}
+
+/* =========================================================
+   Per-Position Deep-Analyse (Sonnet + web_search)
+   ========================================================= */
+
+async function analyzePositionDeep(position, { apiKey } = {}) {
+  if (!apiKey) throw new Error('Anthropic API-Key fehlt (Einstellungen).');
+
+  const current = ensureDD(position);
+  const system = `Du bist ein Equity-Research-Analyst für einen Schweizer Privatanleger. Liefere eine fundierte Due-Diligence zu EINER Aktie/ETF/Fund.
+
+Recherchiere mit web_search aktuelle Earnings, Analyst-Calls, Sektor-News (max. 5 Suchen). Sei knapp und präzise. Keine Floskeln.
+
+Antworte AUSSCHLIESSLICH mit einem validen JSON-Objekt – kein Markdown, kein Text drumherum:
+{
+  "thesis": "1–2 Sätze, max 220 Zeichen, der Investment-Case",
+  "strengths": ["3–5 Bullets, jeweils max 110 Zeichen"],
+  "risks": ["3–5 Bullets, jeweils max 110 Zeichen"],
+  "catalysts": ["2–4 konkrete Events/Earnings/Daten, idealerweise mit Datum"],
+  "fundamentals": "Free-Text mit P/E, EV/EBITDA, Marge, Verschuldung, Wachstum. Max 400 Zeichen.",
+  "summary": "1 Satz für die History, max 120 Zeichen"
+}
+
+WICHTIG: Ergänze, korrigiere nicht aggressiv. Bestehende User-Notes (separates Feld) fasst du NIE an.`;
+
+  const input = {
+    ticker: position.ticker,
+    name: position.name,
+    assetClass: position.assetClass,
+    currency: position.currency,
+    costBasis: position.costBasis,
+    currentPrice: position.currentPrice,
+    bestehendeDD: {
+      thesis: current.thesis,
+      strengths: current.strengths,
+      risks: current.risks,
+      catalysts: current.catalysts,
+      fundamentals: current.fundamentals,
+    },
+  };
+
+  const reply = await callClaude({
+    system,
+    messages: [{ role: 'user', content: `Analysiere diese Position:\n${JSON.stringify(input)}` }],
+    apiKey,
+    model: MODEL_COACH,
+    maxTokens: 2500,
+    tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 5 }],
+  });
+
+  const match = reply.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error('AI lieferte kein JSON.');
+  let parsed;
+  try { parsed = JSON.parse(match[0]); } catch { throw new Error('AI-JSON konnte nicht geparsed werden.'); }
+
+  // Merge: AI-Felder werden ersetzt, userNotes/tags/history bleiben unangetastet
+  const next = { ...current };
+  for (const f of DD_FIELDS_AI_WRITABLE) {
+    if (parsed[f] !== undefined) next[f] = parsed[f];
+  }
+  next.lastAnalyzedAt = Date.now();
+  next.lastAnalysisModel = MODEL_COACH;
+  return appendDDHistory(next, {
+    ts: Date.now(),
+    source: 'deep',
+    summary: parsed.summary || (parsed.thesis || '').slice(0, 120),
+    model: MODEL_COACH,
   });
 }
 
@@ -757,11 +878,233 @@ function PortfolioList({ portfolio, fx, onOpenPosition, onAddPosition }) {
 }
 
 /* =========================================================
+   Due-Diligence UI
+   ========================================================= */
+
+function BulletEditor({ label, items, onChange, placeholder, accent = 'neutral' }) {
+  const [draft, setDraft] = useState('');
+  const add = () => {
+    const v = draft.trim();
+    if (!v) return;
+    onChange([...(items || []), v]);
+    setDraft('');
+  };
+  const remove = (i) => onChange(items.filter((_, idx) => idx !== i));
+  const update = (i, v) => onChange(items.map((it, idx) => (idx === i ? v : it)));
+  const dotColor = {
+    neutral: 'bg-neutral-500',
+    green: 'bg-green-500',
+    red: 'bg-red-500',
+    orange: 'bg-orange-500',
+    blue: 'bg-blue-500',
+  }[accent] || 'bg-neutral-500';
+
+  return (
+    <div className="mb-3">
+      <label className="block text-xs font-medium text-neutral-400 mb-1.5">{label}</label>
+      <div className="space-y-1.5">
+        {(items || []).map((it, i) => (
+          <div key={i} className="flex items-start gap-2 group">
+            <span className={`w-1.5 h-1.5 rounded-full mt-2.5 shrink-0 ${dotColor}`} />
+            <input
+              type="text"
+              value={it}
+              onChange={(e) => update(i, e.target.value)}
+              className="flex-1 bg-neutral-900 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-sm text-white focus:outline-none focus:border-orange-500"
+            />
+            <button
+              onClick={() => remove(i)}
+              className="text-neutral-600 hover:text-red-400 p-1 mt-0.5 opacity-60 group-hover:opacity-100 transition"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        ))}
+        <div className="flex items-center gap-2">
+          <span className={`w-1.5 h-1.5 rounded-full ${dotColor} opacity-30`} />
+          <input
+            type="text"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } }}
+            placeholder={placeholder || `+ ${label.toLowerCase()} hinzufügen`}
+            className="flex-1 bg-neutral-900/50 border border-dashed border-neutral-800 rounded-lg px-2.5 py-1.5 text-sm text-neutral-300 placeholder-neutral-600 focus:outline-none focus:border-orange-500"
+          />
+          {draft && (
+            <button
+              onClick={add}
+              className="text-orange-400 p-1"
+            >
+              <Plus className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DueDiligenceEditor({ position, onUpdate, apiKey }) {
+  const [dd, setDd] = useState(() => ensureDD(position));
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [highlightUntil, setHighlightUntil] = useState(0);
+
+  // Sync wenn Position von außen wechselt
+  useEffect(() => { setDd(ensureDD(position)); }, [position.id]);
+
+  const setField = (k, v) => setDd((d) => ({ ...d, [k]: v }));
+
+  const save = () => {
+    onUpdate({ ...position, dueDiligence: dd, note: dd.thesis || position.note || '' });
+  };
+
+  const runDeepAnalysis = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const next = await analyzePositionDeep(position, { apiKey });
+      // userNotes/tags aus aktuellem (vielleicht ungespeichertem) Local-State holen
+      const merged = { ...next, userNotes: dd.userNotes, tags: dd.tags };
+      setDd(merged);
+      setHighlightUntil(Date.now() + 4000);
+      onUpdate({ ...position, dueDiligence: merged, note: merged.thesis || position.note || '' });
+    } catch (e) {
+      setError(e.message || 'Deep-Analyse fehlgeschlagen.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const isFresh = highlightUntil > Date.now();
+  const ago = dd.lastAnalyzedAt
+    ? Math.max(0, Math.round((Date.now() - dd.lastAnalyzedAt) / 60000))
+    : null;
+  const agoLabel = !dd.lastAnalyzedAt
+    ? 'Noch keine AI-Analyse'
+    : ago < 60 ? `AI-Analyse: vor ${ago} Min`
+    : ago < 60 * 24 ? `AI-Analyse: vor ${Math.round(ago / 60)} h`
+    : `AI-Analyse: vor ${Math.round(ago / 60 / 24)} Tagen`;
+
+  return (
+    <Card className={`p-4 transition ${isFresh ? 'ring-1 ring-orange-500/40' : ''}`}>
+      <div className="flex items-start justify-between mb-3 gap-2">
+        <div>
+          <h4 className="text-white font-semibold flex items-center gap-2">
+            <Sparkles className="w-4 h-4 text-orange-400" /> Due Diligence
+          </h4>
+          <p className="text-[11px] text-neutral-500 mt-0.5">{agoLabel}</p>
+        </div>
+        <button
+          onClick={runDeepAnalysis}
+          disabled={loading || !apiKey}
+          title={!apiKey ? 'Anthropic API-Key in Einstellungen' : ''}
+          className="flex items-center gap-1.5 bg-orange-500/15 hover:bg-orange-500/25 disabled:opacity-40 text-orange-400 px-3 py-1.5 rounded-lg text-xs font-medium transition shrink-0"
+        >
+          {loading ? <Spinner size={3} /> : <Sparkles className="w-3.5 h-3.5" />}
+          {loading ? 'Analysiere…' : 'Tief analysieren'}
+        </button>
+      </div>
+
+      {error && (
+        <div className="mb-3 text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
+          <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {error}
+        </div>
+      )}
+
+      <TextArea
+        label="Thesis"
+        value={dd.thesis}
+        onChange={(v) => setField('thesis', v)}
+        placeholder="Warum hältst du diese Position?"
+        rows={2}
+      />
+
+      <BulletEditor
+        label="Stärken"
+        items={dd.strengths}
+        onChange={(v) => setField('strengths', v)}
+        accent="green"
+        placeholder="+ Stärke hinzufügen"
+      />
+      <BulletEditor
+        label="Risiken"
+        items={dd.risks}
+        onChange={(v) => setField('risks', v)}
+        accent="red"
+        placeholder="+ Risiko hinzufügen"
+      />
+      <BulletEditor
+        label="Catalysts (Events / Earnings)"
+        items={dd.catalysts}
+        onChange={(v) => setField('catalysts', v)}
+        accent="orange"
+        placeholder="+ z.B. Q4-Earnings 28.02.2026"
+      />
+
+      <TextArea
+        label="Fundamentals (P/E, Margen, Verschuldung…)"
+        value={dd.fundamentals}
+        onChange={(v) => setField('fundamentals', v)}
+        placeholder="Frei: KGV 18, Op-Marge 28%, Net Debt/EBITDA 1.2x…"
+        rows={3}
+      />
+
+      <TextArea
+        label="Eigene Notizen (AI fasst diese NIE an)"
+        value={dd.userNotes}
+        onChange={(v) => setField('userNotes', v)}
+        placeholder="Dein eigener Knowledge-Layer."
+        rows={2}
+      />
+
+      <BulletEditor
+        label="Tags"
+        items={dd.tags}
+        onChange={(v) => setField('tags', v)}
+        accent="blue"
+        placeholder="+ Tag (z.B. defensiv, dividend, AI-Welle)"
+      />
+
+      {(dd.history || []).length > 0 && (
+        <button
+          onClick={() => setHistoryOpen((x) => !x)}
+          className="flex items-center gap-1 text-xs text-neutral-400 hover:text-neutral-200 mt-2 mb-2"
+        >
+          <ChevronRight className={`w-3.5 h-3.5 transition-transform ${historyOpen ? 'rotate-90' : ''}`} />
+          Analyse-Historie ({dd.history.length})
+        </button>
+      )}
+      {historyOpen && (
+        <div className="space-y-2 mb-3">
+          {dd.history.map((h, i) => {
+            const d = new Date(h.ts);
+            return (
+              <div key={i} className="text-xs bg-neutral-900/60 border border-neutral-800 rounded-lg p-2">
+                <div className="flex items-center justify-between text-neutral-500 mb-1">
+                  <span>{d.toLocaleString('de-CH', { dateStyle: 'short', timeStyle: 'short' })}</span>
+                  <Pill color={h.source === 'deep' ? 'accent' : h.source === 'assessment' ? 'blue' : 'neutral'}>
+                    {h.source === 'deep' ? 'Deep' : h.source === 'assessment' ? 'Assess' : 'Manual'}
+                  </Pill>
+                </div>
+                <p className="text-neutral-300">{h.summary}</p>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <PrimaryBtn onClick={save}>DD speichern</PrimaryBtn>
+    </Card>
+  );
+}
+
+/* =========================================================
    Position-Detail-Modal
    ========================================================= */
 
-function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onLogTrade }) {
-  const [note, setNote] = useState(position.note || '');
+function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onLogTrade, apiKey }) {
   const [stopLoss, setStopLoss] = useState(position.stopLoss ?? '');
   const [sellShares, setSellShares] = useState('');
   const [sellPrice, setSellPrice] = useState('');
@@ -771,10 +1114,9 @@ function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onL
   const p = computePosition(position, fx);
   const positionTrades = trades.filter((t) => t.ticker === position.ticker);
 
-  const saveMeta = () => {
+  const saveStopLoss = () => {
     onUpdate({
       ...position,
-      note,
       stopLoss: stopLoss === '' || stopLoss == null ? null : parseFloat(stopLoss),
     });
   };
@@ -845,29 +1187,28 @@ function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onL
         </Card>
 
         <Card className="p-4">
-          <h4 className="text-white font-semibold mb-2">Aktueller Kurs aktualisieren</h4>
-          <TextField
-            label="Neuer Kurs"
-            type="number"
-            step="0.01"
-            value={position.currentPrice}
-            onChange={(v) => onUpdate({ ...position, currentPrice: parseFloat(v) || 0 })}
-          />
+          <h4 className="text-white font-semibold mb-2">Kurs & Stop-Loss</h4>
+          <div className="grid grid-cols-2 gap-3">
+            <TextField
+              label="Aktueller Kurs (Override)"
+              type="number"
+              step="0.01"
+              value={position.currentPrice}
+              onChange={(v) => onUpdate({ ...position, currentPrice: parseFloat(v) || 0 })}
+            />
+            <TextField
+              label={`Stop-Loss (${position.currency})`}
+              type="number"
+              step="0.01"
+              value={stopLoss}
+              onChange={setStopLoss}
+              placeholder="z.B. 18.50"
+            />
+          </div>
+          <PrimaryBtn onClick={saveStopLoss}>Stop-Loss speichern</PrimaryBtn>
         </Card>
 
-        <Card className="p-4">
-          <h4 className="text-white font-semibold mb-2">Notiz / These</h4>
-          <TextArea value={note} onChange={setNote} placeholder="Warum hältst du diese Position?" />
-          <TextField
-            label={`Stop-Loss (${position.currency})`}
-            type="number"
-            step="0.01"
-            value={stopLoss}
-            onChange={setStopLoss}
-            placeholder="z.B. 18.50"
-          />
-          <PrimaryBtn onClick={saveMeta}>Speichern</PrimaryBtn>
-        </Card>
+        <DueDiligenceEditor position={position} onUpdate={onUpdate} apiKey={apiKey} />
 
         <Card className="p-4">
           <h4 className="text-white font-semibold mb-2">Verkauf loggen</h4>
@@ -1427,7 +1768,7 @@ function ConvertToPositionModal({ item, onClose, onConfirm }) {
    Coach (AI Chat) Tab
    ========================================================= */
 
-function CoachTab({ portfolio, trades, watchlist, fx, apiKey, chatHistory, setChatHistory, onAddWatchlistFromAI, assessmentTrigger, onAssessmentDone }) {
+function CoachTab({ portfolio, trades, watchlist, fx, apiKey, chatHistory, setChatHistory, onAddWatchlistFromAI, onApplyDDUpdate, assessmentTrigger, onAssessmentDone }) {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
@@ -1440,33 +1781,63 @@ function CoachTab({ portfolio, trades, watchlist, fx, apiKey, chatHistory, setCh
   }, [chatHistory, loading]);
 
   const buildSystem = () => {
+    // Kompakte Portfolio-Liste – Position + 1-Zeilen-DD-Snapshot. Spart Tokens.
     const portfolioSummary = portfolio.map((p) => {
       const c = computePosition(p, fx);
+      const dd = p.dueDiligence || {};
       return {
-        ticker: p.ticker, name: p.name, assetClass: p.assetClass,
-        shares: p.shares, currency: p.currency,
-        costBasis: p.costBasis, currentPrice: p.currentPrice,
-        mvCHF: Math.round(c.mvCHF), plPct: Number(c.plPct.toFixed(2)),
-        stopLoss: p.stopLoss,
+        t: p.ticker,
+        n: p.name,
+        cls: p.assetClass,
+        ccy: p.currency,
+        qty: p.shares,
+        cost: p.costBasis,
+        px: p.currentPrice,
+        mvCHF: Math.round(c.mvCHF),
+        pl: Number(c.plPct.toFixed(2)),
+        sl: p.stopLoss,
+        th: (dd.thesis || p.note || '').slice(0, 140),
+        topRisks: (dd.risks || []).slice(0, 2),
+        tags: dd.tags || [],
+        ddDeep: !!dd.lastAnalyzedAt,
       };
     });
     const totalCHF = portfolio.reduce((s, p) => s + toCHF(p.shares * p.currentPrice, p.currency, fx), 0);
-    return `Du bist ein erfahrener, ehrlicher Finanzberater für einen Schweizer Privatanleger. Du sprichst Deutsch (Du-Form). Du bist direkt, datenbasiert und nicht zu vorsichtig. Du erinnerst den User an Disziplin (Stop-Losses, Gewinnmitnahmen, Diversifikation). Du schmeichelst nicht. Du erwähnst Steuer-Aspekte der Schweiz wenn relevant (keine Kapitalgewinnsteuer privat). Du kannst Aktien zur Watchlist vorschlagen mit dem Format: [WATCHLIST_VORSCHLAG: TICKER | NAME | THESE]. Nutze dieses Format wörtlich, wenn du eine konkrete Aktie empfiehlst aufzunehmen.
+    return `Du bist ein erfahrener, ehrlicher Finanzberater für einen Schweizer Privatanleger. Du sprichst Deutsch (Du-Form). Du bist direkt, datenbasiert und nicht zu vorsichtig. Du erinnerst den User an Disziplin (Stop-Losses, Gewinnmitnahmen, Diversifikation). Du schmeichelst nicht. Du erwähnst Steuer-Aspekte der Schweiz wenn relevant (keine Kapitalgewinnsteuer privat).
 
 TOOLS: Du hast Zugriff auf das web_search-Tool. Nutze es SPARSAM – nur wenn der User explizit nach aktuellen News, Earnings, Analyst-Calls oder tagesaktuellen Ereignissen fragt. Für reine Portfolio-Analyse (Klumpenrisiken, Diversifikation, Sektoren-Mix) brauchst du KEINE Web-Suche – dafür reichen die Portfolio-Daten unten. Token-Disziplin.
 
+MARKER, die du am ENDE deiner Antwort verwenden darfst (jeweils auf eigene Zeile, ohne sonstige Erklärung im Marker selbst):
+
+[WATCHLIST_VORSCHLAG: TICKER | NAME | THESE]
+  → konkrete Aktie für Watchlist empfehlen.
+
+[POSITION_DD: TICKER | <field> | <op> <value>]
+  → DD-Update zu einer bestehenden Position vorschlagen (User bestätigt).
+  <field> ∈ {thesis, fundamentals, strengths, risks, catalysts}
+  <op> ∈ { + (an Liste anhängen), - (aus Liste entfernen), = (Text ersetzen) }
+  Beispiele:
+    [POSITION_DD: NOVN | risks | + Patent-Cliff Entresto 2026 ]
+    [POSITION_DD: AAPL | catalysts | + Q1-Earnings 30.01.2026 ]
+    [POSITION_DD: ROG | thesis | = Defensiver Pharma-Anker mit Diagnostics-Hebel ]
+  Nutze POSITION_DD nur, wenn du wirklich neue oder präzisere Erkenntnisse hast.
+  ÜBERSCHREIBE NIE 'userNotes' oder 'tags' einer Position – das gehört dem User.
+
+[NEED_DD: TICKER]
+  → Du brauchst tiefere Daten zu dieser Position, der User soll eine Deep-Analyse anstoßen.
+
 KONTEXT:
 Total Portfolio CHF: ${Math.round(totalCHF)}
-FX-Raten (in CHF): ${JSON.stringify(fx)}
+FX (in CHF): ${JSON.stringify(fx)}
 
-Portfolio (JSON):
-${JSON.stringify(portfolioSummary, null, 2)}
+Portfolio (Compact-JSON, eine Zeile pro Position):
+${portfolioSummary.map((x) => JSON.stringify(x)).join('\n')}
 
-Trades-History (JSON):
-${JSON.stringify(trades.slice(-30), null, 2)}
+Trades-History (letzte 30):
+${JSON.stringify(trades.slice(-30))}
 
-Watchlist (JSON):
-${JSON.stringify(watchlist, null, 2)}`;
+Watchlist:
+${JSON.stringify(watchlist)}`;
   };
 
   const send = async (overrideText) => {
@@ -1504,7 +1875,7 @@ ${JSON.stringify(watchlist, null, 2)}`;
   // Trigger für Assessment vom Dashboard
   useEffect(() => {
     if (assessmentTrigger) {
-      const prompt = 'Mache ein vollständiges Assessment dieses Portfolios. Strukturiert mit: 1) Stärken, 2) Risiken/Klumpen, 3) Konkrete Handlungsempfehlungen (3-5 Punkte), 4) Eine Aktie zum eventuellen Verkauf, 5) Eine Aktie für die Watchlist als Ergänzung.';
+      const prompt = 'Mache ein vollständiges Assessment dieses Portfolios. Strukturiert mit: 1) Stärken, 2) Risiken/Klumpen, 3) Konkrete Handlungsempfehlungen (3-5 Punkte), 4) Eine Aktie zum eventuellen Verkauf, 5) Eine Aktie für die Watchlist als Ergänzung. Wenn dir konkrete Risiken, Catalysts oder Thesis-Updates zu einzelnen Positionen auffallen, emittiere am Ende [POSITION_DD: …]-Marker für jede Erkenntnis (max. 6).';
       send(prompt);
       onAssessmentDone();
     }
@@ -1521,8 +1892,38 @@ ${JSON.stringify(watchlist, null, 2)}`;
     return out;
   };
 
-  const stripSuggestions = (text) =>
-    text.replace(/\[WATCHLIST_VORSCHLAG:[^\]]*\]/g, '').trim();
+  // [POSITION_DD: TICKER | field | <op> <value>]
+  const parsePositionDDUpdates = (text) => {
+    const re = /\[POSITION_DD:\s*([^|]+?)\s*\|\s*([a-zA-Z]+)\s*\|\s*([+\-=])\s*([^\]]+?)\s*\]/g;
+    const out = [];
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const field = m[2].trim();
+      if (!['thesis', 'fundamentals', 'strengths', 'risks', 'catalysts'].includes(field)) continue;
+      out.push({
+        ticker: m[1].trim().toUpperCase(),
+        field,
+        op: m[3].trim(),
+        value: m[4].trim(),
+      });
+    }
+    return out;
+  };
+
+  const parseNeedDD = (text) => {
+    const re = /\[NEED_DD:\s*([^\]]+?)\s*\]/g;
+    const out = [];
+    let m;
+    while ((m = re.exec(text)) !== null) out.push(m[1].trim().toUpperCase());
+    return out;
+  };
+
+  const stripMarkers = (text) =>
+    text
+      .replace(/\[WATCHLIST_VORSCHLAG:[^\]]*\]/g, '')
+      .replace(/\[POSITION_DD:[^\]]*\]/g, '')
+      .replace(/\[NEED_DD:[^\]]*\]/g, '')
+      .trim();
 
   const newChat = () => {
     if (confirm('Chatverlauf löschen?')) setChatHistory([]);
@@ -1568,7 +1969,9 @@ ${JSON.stringify(watchlist, null, 2)}`;
         {chatHistory.map((m, idx) => {
           const isUser = m.role === 'user';
           const suggestions = !isUser ? parseSuggestions(m.content) : [];
-          const cleaned = !isUser ? stripSuggestions(m.content) : m.content;
+          const ddUpdates = !isUser ? parsePositionDDUpdates(m.content) : [];
+          const needDD = !isUser ? parseNeedDD(m.content) : [];
+          const cleaned = !isUser ? stripMarkers(m.content) : m.content;
           return (
             <div key={idx} className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
               <div
@@ -1589,6 +1992,34 @@ ${JSON.stringify(watchlist, null, 2)}`;
                         suggestion={s}
                         onAccept={() => onAddWatchlistFromAI(s)}
                       />
+                    ))}
+                  </div>
+                )}
+                {ddUpdates.length > 0 && (
+                  <div className="mt-3 space-y-2">
+                    {ddUpdates.map((u, i) => {
+                      const known = portfolio.some((p) => p.ticker === u.ticker);
+                      return (
+                        <DDUpdateCard
+                          key={i}
+                          update={u}
+                          knownTicker={known}
+                          onAccept={() => onApplyDDUpdate?.(u)}
+                        />
+                      );
+                    })}
+                  </div>
+                )}
+                {needDD.length > 0 && (
+                  <div className="mt-3 space-y-1">
+                    {needDD.map((tk, i) => (
+                      <div
+                        key={i}
+                        className="text-[11px] text-orange-300 bg-orange-500/10 border border-orange-500/30 rounded-lg px-2.5 py-1.5 flex items-center gap-1.5"
+                      >
+                        <Info className="w-3.5 h-3.5" />
+                        Coach möchte tiefere Daten zu <b>{tk}</b>. Öffne die Position und klicke „Tief analysieren".
+                      </div>
                     ))}
                   </div>
                 )}
@@ -1641,6 +2072,57 @@ ${JSON.stringify(watchlist, null, 2)}`;
   );
 }
 
+function DDUpdateCard({ update, knownTicker, onAccept }) {
+  const [done, setDone] = useState(false);
+  const [skipped, setSkipped] = useState(false);
+  const opLabel = update.op === '+' ? 'Hinzufügen' : update.op === '-' ? 'Entfernen' : 'Ersetzen';
+  const fieldLabel = {
+    thesis: 'Thesis',
+    fundamentals: 'Fundamentals',
+    strengths: 'Stärke',
+    risks: 'Risiko',
+    catalysts: 'Catalyst',
+  }[update.field] || update.field;
+
+  if (skipped) return null;
+
+  return (
+    <div className="bg-neutral-900 border border-blue-500/40 rounded-xl p-3">
+      <div className="flex items-center justify-between mb-1.5">
+        <p className="text-[10px] text-blue-400 font-semibold uppercase tracking-wide">
+          DD-Update · {update.ticker}
+        </p>
+        <Pill color="blue">{opLabel} {fieldLabel}</Pill>
+      </div>
+      <p className="text-neutral-200 text-sm">{update.value}</p>
+      {!knownTicker && (
+        <p className="text-[11px] text-orange-300 mt-1">⚠ Ticker nicht im Portfolio</p>
+      )}
+      {done ? (
+        <div className="mt-2 flex items-center gap-1 text-green-400 text-xs">
+          <Check className="w-4 h-4" /> Übernommen
+        </div>
+      ) : (
+        <div className="flex gap-2 mt-2">
+          <button
+            onClick={() => { if (!knownTicker) return; onAccept(); setDone(true); }}
+            disabled={!knownTicker}
+            className="flex-1 bg-blue-500/20 hover:bg-blue-500/30 disabled:opacity-40 text-blue-300 font-medium py-1.5 rounded-lg text-xs"
+          >
+            Übernehmen
+          </button>
+          <button
+            onClick={() => setSkipped(true)}
+            className="px-3 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 font-medium py-1.5 rounded-lg text-xs"
+          >
+            Verwerfen
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SuggestionCard({ suggestion, onAccept }) {
   const [added, setAdded] = useState(false);
   return (
@@ -1668,15 +2150,59 @@ function SuggestionCard({ suggestion, onAccept }) {
    Settings Modal
    ========================================================= */
 
-function SettingsModal({ open, onClose, settings, setSettings, onReset }) {
+function SettingsModal({ open, onClose, settings, setSettings, onReset, portfolio, trades, watchlist, onImport }) {
   const [fx, setFx] = useState(settings.fx);
   const [apiKey, setApiKey] = useState(settings.apiKey || '');
   const [finnhubKey, setFinnhubKey] = useState(settings.finnhubKey || '');
+  const [importErr, setImportErr] = useState('');
+  const fileInputRef = useRef(null);
   useEffect(() => {
     setFx(settings.fx);
     setApiKey(settings.apiKey || '');
     setFinnhubKey(settings.finnhubKey || '');
+    setImportErr('');
   }, [settings.fx, settings.apiKey, settings.finnhubKey, open]);
+
+  const exportData = () => {
+    const payload = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      portfolio,
+      trades,
+      watchlist,
+      settings: { fx: settings.fx }, // KEINE API-Keys exportieren
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `ai-berater-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportFile = async (e) => {
+    setImportErr('');
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const txt = await file.text();
+      const data = JSON.parse(txt);
+      if (!data || !Array.isArray(data.portfolio)) throw new Error('Ungültiges Backup-Format (portfolio fehlt).');
+      if (!confirm(`Backup vom ${data.exportedAt?.slice(0,10) || '?'} importieren? Überschreibt Portfolio (${data.portfolio.length}), Trades (${data.trades?.length || 0}) und Watchlist (${data.watchlist?.length || 0}).`)) {
+        e.target.value = '';
+        return;
+      }
+      onImport(data);
+      onClose();
+    } catch (err) {
+      setImportErr(err.message || 'Import fehlgeschlagen.');
+    } finally {
+      e.target.value = '';
+    }
+  };
 
   const save = () => {
     setSettings({
@@ -1720,6 +2246,29 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset }) {
         <TextField label="1 USD =" type="number" step="0.0001" value={fx.USD} onChange={(v) => setFx({ ...fx, USD: v })} />
         <TextField label="1 EUR =" type="number" step="0.0001" value={fx.EUR} onChange={(v) => setFx({ ...fx, EUR: v })} />
         <TextField label="1 SEK =" type="number" step="0.0001" value={fx.SEK} onChange={(v) => setFx({ ...fx, SEK: v })} />
+      </Card>
+      <Card className="p-4 mb-3">
+        <h4 className="text-white font-semibold mb-1">Backup (Export / Import)</h4>
+        <p className="text-neutral-400 text-xs mb-3">
+          Deine Daten leben nur in diesem Browser. Mach regelmässig Backups – inkl. Due-Diligence-Notizen.
+          API-Keys werden aus Sicherheitsgründen NICHT exportiert.
+        </p>
+        <div className="grid grid-cols-2 gap-2">
+          <GhostBtn onClick={exportData}>Exportieren</GhostBtn>
+          <GhostBtn onClick={() => fileInputRef.current?.click()}>Importieren</GhostBtn>
+        </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="application/json"
+          onChange={handleImportFile}
+          className="hidden"
+        />
+        {importErr && (
+          <div className="mt-2 text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
+            <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {importErr}
+          </div>
+        )}
       </Card>
       <Card className="p-4">
         <h4 className="text-white font-semibold mb-2">Daten zurücksetzen</h4>
@@ -1862,7 +2411,7 @@ export default function App() {
         storage.get('settings'),
         storage.get('onboardingSeen'),
       ]);
-      setPortfolio(p ?? DEMO_PORTFOLIO);
+      setPortfolio(migrateDD(p ?? DEMO_PORTFOLIO));
       setTrades(t ?? []);
       setWatchlist(w ?? DEMO_WATCHLIST);
       setChatHistory(c ?? []);
@@ -1888,6 +2437,36 @@ export default function App() {
     setPortfolio((arr) => arr.filter((x) => x.id !== id));
   const addPosition = (pos) => setPortfolio((arr) => [pos, ...arr]);
   const addPositions = (positions) => setPortfolio((arr) => [...positions, ...arr]);
+
+  // DD-Updates aus dem Coach-Assessment auf eine Position anwenden.
+  // update: { ticker, field, op: '+'|'-'|'=', value }
+  // Gibt true zurück, wenn die Position gefunden und gemerged wurde.
+  const applyDDUpdate = (update) => {
+    let applied = false;
+    setPortfolio((arr) => arr.map((p) => {
+      if (p.ticker !== update.ticker) return p;
+      if (update.field === 'userNotes' || update.field === 'tags') return p; // AI darf das nicht
+      const dd = ensureDD(p);
+      let nextField;
+      if (DD_LIST_FIELDS.includes(update.field)) {
+        const list = dd[update.field] || [];
+        if (update.op === '+') nextField = [...list, update.value];
+        else if (update.op === '-') nextField = list.filter((x) => x !== update.value);
+        else nextField = [update.value];
+      } else if (DD_TEXT_FIELDS.includes(update.field) || update.field === 'thesis' || update.field === 'fundamentals') {
+        nextField = update.value;
+      } else {
+        return p;
+      }
+      const newDD = appendDDHistory(
+        { ...dd, [update.field]: nextField, lastAnalyzedAt: Date.now() },
+        { ts: Date.now(), source: 'assessment', summary: `${update.op === '+' ? '+' : update.op === '-' ? '–' : '='} ${update.field}: ${String(update.value).slice(0, 80)}`, model: MODEL_COACH },
+      );
+      applied = true;
+      return { ...p, dueDiligence: newDD, note: update.field === 'thesis' ? update.value : p.note };
+    }));
+    return applied;
+  };
 
   // Live-Kurs Refresh
   const [refreshing, setRefreshing] = useState(false);
@@ -2035,6 +2614,7 @@ export default function App() {
             chatHistory={chatHistory}
             setChatHistory={setChatHistory}
             onAddWatchlistFromAI={addWatchlistFromAI}
+            onApplyDDUpdate={applyDDUpdate}
             assessmentTrigger={assessmentTrigger}
             onAssessmentDone={() => {}}
           />
@@ -2047,6 +2627,7 @@ export default function App() {
             position={openPos}
             trades={trades}
             fx={fx}
+            apiKey={settings.apiKey}
             onClose={() => setOpenPositionId(null)}
             onUpdate={updatePosition}
             onDelete={deletePosition}
@@ -2068,6 +2649,17 @@ export default function App() {
           settings={settings}
           setSettings={setSettingsState}
           onReset={reset}
+          portfolio={portfolio}
+          trades={trades}
+          watchlist={watchlist}
+          onImport={(data) => {
+            setPortfolio(migrateDD(data.portfolio || []));
+            setTrades(Array.isArray(data.trades) ? data.trades : []);
+            setWatchlist(Array.isArray(data.watchlist) ? data.watchlist : []);
+            if (data.settings?.fx) {
+              setSettingsState((s) => ({ ...s, fx: { ...DEFAULT_FX, ...data.settings.fx, CHF: 1 } }));
+            }
+          }}
         />
 
         {showOnboarding && <Onboarding onClose={finishOnboarding} />}
