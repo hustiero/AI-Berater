@@ -87,7 +87,7 @@ const storage = {
    AI Call (Anthropic)
    ========================================================= */
 
-async function callClaude({ system, messages }) {
+async function callClaude({ system, messages, apiKey }) {
   // Falls Artifact-Runtime ein window.claude.complete bereitstellt, nutze es
   if (typeof window !== 'undefined' && window.claude && typeof window.claude.complete === 'function') {
     const transcript = messages
@@ -97,10 +97,14 @@ async function callClaude({ system, messages }) {
     const out = await window.claude.complete(prompt);
     return typeof out === 'string' ? out : (out?.completion || '');
   }
+  if (!apiKey) {
+    throw new Error('Kein Anthropic API-Key gesetzt. Trag ihn in den Einstellungen (Zahnrad oben rechts) ein.');
+  }
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      'x-api-key': apiKey,
       'anthropic-version': '2023-06-01',
       'anthropic-dangerous-direct-browser-access': 'true',
     },
@@ -1116,7 +1120,7 @@ function ConvertToPositionModal({ item, onClose, onConfirm }) {
    Coach (AI Chat) Tab
    ========================================================= */
 
-function CoachTab({ portfolio, trades, watchlist, fx, chatHistory, setChatHistory, onAddWatchlistFromAI, assessmentTrigger, onAssessmentDone }) {
+function CoachTab({ portfolio, trades, watchlist, fx, apiKey, chatHistory, setChatHistory, onAddWatchlistFromAI, assessmentTrigger, onAssessmentDone }) {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
@@ -1170,6 +1174,7 @@ ${JSON.stringify(watchlist, null, 2)}`;
       const reply = await callClaude({
         system: buildSystem(),
         messages: apiMessages,
+        apiKey,
       });
       setChatHistory([...next, { role: 'assistant', content: reply, ts: Date.now() }]);
     } catch (e) {
@@ -1354,15 +1359,23 @@ function SuggestionCard({ suggestion, onAccept }) {
 
 function SettingsModal({ open, onClose, settings, setSettings, onReset }) {
   const [fx, setFx] = useState(settings.fx);
-  useEffect(() => setFx(settings.fx), [settings.fx, open]);
+  const [apiKey, setApiKey] = useState(settings.apiKey || '');
+  useEffect(() => {
+    setFx(settings.fx);
+    setApiKey(settings.apiKey || '');
+  }, [settings.fx, settings.apiKey, open]);
 
   const save = () => {
-    setSettings({ ...settings, fx: {
-      CHF: 1,
-      USD: parseFloat(fx.USD) || DEFAULT_FX.USD,
-      EUR: parseFloat(fx.EUR) || DEFAULT_FX.EUR,
-      SEK: parseFloat(fx.SEK) || DEFAULT_FX.SEK,
-    }});
+    setSettings({
+      ...settings,
+      apiKey: apiKey.trim(),
+      fx: {
+        CHF: 1,
+        USD: parseFloat(fx.USD) || DEFAULT_FX.USD,
+        EUR: parseFloat(fx.EUR) || DEFAULT_FX.EUR,
+        SEK: parseFloat(fx.SEK) || DEFAULT_FX.SEK,
+      },
+    });
     onClose();
   };
 
@@ -1373,6 +1386,13 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset }) {
       title="Einstellungen"
       footer={<PrimaryBtn onClick={save}>Speichern</PrimaryBtn>}
     >
+      <Card className="p-4 mb-3">
+        <h4 className="text-white font-semibold mb-2">Anthropic API-Key</h4>
+        <p className="text-neutral-400 text-xs mb-2">
+          Wird lokal gespeichert und direkt an api.anthropic.com gesendet. Hol dir einen Key auf console.anthropic.com.
+        </p>
+        <TextField label="sk-ant-…" type="password" value={apiKey} onChange={setApiKey} placeholder="sk-ant-api03-…" />
+      </Card>
       <Card className="p-4 mb-3">
         <h4 className="text-white font-semibold mb-2">FX-Raten (zu CHF)</h4>
         <TextField label="1 USD =" type="number" step="0.0001" value={fx.USD} onChange={(v) => setFx({ ...fx, USD: v })} />
@@ -1630,6 +1650,7 @@ export default function App() {
             trades={trades}
             watchlist={watchlist}
             fx={fx}
+            apiKey={settings.apiKey}
             chatHistory={chatHistory}
             setChatHistory={setChatHistory}
             onAddWatchlistFromAI={addWatchlistFromAI}
