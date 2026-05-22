@@ -378,10 +378,30 @@ Wähle den passendsten Wert basierend auf ticker/name/industry. Bei Unsicherheit
    Due-Diligence Schema + Migration
    ========================================================= */
 
-const DD_FIELDS_AI_WRITABLE = ['thesis', 'strengths', 'risks', 'catalysts', 'fundamentals'];
+const DD_FIELDS_AI_WRITABLE = ['thesis', 'strengths', 'risks', 'catalysts', 'fundamentals', 'recommendation'];
 const DD_LIST_FIELDS = ['strengths', 'risks', 'catalysts', 'tags'];
 const DD_TEXT_FIELDS = ['thesis', 'fundamentals', 'userNotes'];
 const DD_HISTORY_CAP = 5;
+
+const VERDICTS = ['sell', 'reduce', 'hold', 'add', 'watch'];
+const VERDICT_RANK = { sell: 0, reduce: 1, add: 2, watch: 3, hold: 4, '': 5 };
+const VERDICT_LABEL = {
+  sell: 'Verkaufen',
+  reduce: 'Reduzieren',
+  hold: 'Halten',
+  add: 'Nachkaufen',
+  watch: 'Beobachten',
+};
+const VERDICT_COLOR = {
+  sell: 'red',
+  reduce: 'accent',
+  hold: 'neutral',
+  add: 'green',
+  watch: 'blue',
+};
+const VERDICT_EMOJI = {
+  sell: '🔴', reduce: '🟠', hold: '⚪', add: '🟢', watch: '🔵',
+};
 
 function emptyDD() {
   return {
@@ -392,6 +412,7 @@ function emptyDD() {
     fundamentals: '',
     userNotes: '',
     tags: [],
+    recommendation: { verdict: '', confidence: '', rationale: '', setAt: null },
     lastAnalyzedAt: null,
     lastAnalysisModel: '',
     history: [],
@@ -399,20 +420,28 @@ function emptyDD() {
 }
 
 function ensureDD(position) {
+  const base = emptyDD();
   if (position.dueDiligence && typeof position.dueDiligence === 'object') {
     const d = position.dueDiligence;
+    const rec = d.recommendation && typeof d.recommendation === 'object' ? d.recommendation : {};
     return {
-      ...emptyDD(),
+      ...base,
       ...d,
       strengths: Array.isArray(d.strengths) ? d.strengths : [],
       risks: Array.isArray(d.risks) ? d.risks : [],
       catalysts: Array.isArray(d.catalysts) ? d.catalysts : [],
       tags: Array.isArray(d.tags) ? d.tags : [],
       history: Array.isArray(d.history) ? d.history : [],
+      recommendation: {
+        verdict: VERDICTS.includes(rec.verdict) ? rec.verdict : '',
+        confidence: ['low', 'medium', 'high'].includes(rec.confidence) ? rec.confidence : '',
+        rationale: typeof rec.rationale === 'string' ? rec.rationale : '',
+        setAt: typeof rec.setAt === 'number' ? rec.setAt : null,
+      },
     };
   }
   // Migration: alte Position ohne DD. note → thesis.
-  return { ...emptyDD(), thesis: position.note || '' };
+  return { ...base, thesis: position.note || '' };
 }
 
 function migrateDD(positions) {
@@ -443,10 +472,24 @@ Antworte AUSSCHLIESSLICH mit einem validen JSON-Objekt – kein Markdown, kein T
   "risks": ["3–5 Bullets, jeweils max 110 Zeichen"],
   "catalysts": ["2–4 konkrete Events/Earnings/Daten, idealerweise mit Datum"],
   "fundamentals": "Free-Text mit P/E, EV/EBITDA, Marge, Verschuldung, Wachstum. Max 400 Zeichen.",
+  "recommendation": {
+    "verdict": "sell|reduce|hold|add|watch",
+    "confidence": "low|medium|high",
+    "rationale": "1–2 Sätze, max 240 Zeichen, warum dieser Verdict"
+  },
   "summary": "1 Satz für die History, max 120 Zeichen"
 }
 
-WICHTIG: Ergänze, korrigiere nicht aggressiv. Bestehende User-Notes (separates Feld) fasst du NIE an.`;
+VERDICT-LEITPLANKE:
+- "sell": klare These zum kompletten Ausstieg (Strukturbruch, Bilanz, Bewertung überreizt)
+- "reduce": Position aktuell zu gross / Gewinnmitnahme angebracht / Risiken steigen
+- "hold": These intakt, keine starken neuen Signale
+- "add": Bewertung/Chance-Risiko spricht für aufstocken
+- "watch": noch unklar, beobachten (z.B. vor Earnings)
+
+Bei Watchlist-Items (Position ist noch nicht gehalten): "watch" oder "add" sind die typischen Verdicts; "sell"/"reduce" passen nicht.
+
+WICHTIG: Ergänze und überarbeite, aber lass bestehende User-Notes (separates Feld) unangetastet. Recommendation muss bei jedem Aufruf gesetzt sein.`;
 
   const input = {
     ticker: position.ticker,
@@ -461,6 +504,7 @@ WICHTIG: Ergänze, korrigiere nicht aggressiv. Bestehende User-Notes (separates 
       risks: current.risks,
       catalysts: current.catalysts,
       fundamentals: current.fundamentals,
+      recommendation: current.recommendation,
     },
   };
 
@@ -478,20 +522,118 @@ WICHTIG: Ergänze, korrigiere nicht aggressiv. Bestehende User-Notes (separates 
   let parsed;
   try { parsed = JSON.parse(match[0]); } catch { throw new Error('AI-JSON konnte nicht geparsed werden.'); }
 
-  // Merge: AI-Felder werden ersetzt, userNotes/tags/history bleiben unangetastet
-  const next = { ...current };
-  for (const f of DD_FIELDS_AI_WRITABLE) {
-    if (parsed[f] !== undefined) next[f] = parsed[f];
-  }
-  next.lastAnalyzedAt = Date.now();
-  next.lastAnalysisModel = MODEL_COACH;
-  return appendDDHistory(next, {
-    ts: Date.now(),
-    source: 'deep',
+  // Vorschläge bauen – KEIN Merge mehr. User entscheidet pro Feld im Diff-Modal.
+  const proposed = {
+    thesis: typeof parsed.thesis === 'string' ? parsed.thesis : current.thesis,
+    fundamentals: typeof parsed.fundamentals === 'string' ? parsed.fundamentals : current.fundamentals,
+    strengths: Array.isArray(parsed.strengths) ? parsed.strengths.map(String) : current.strengths,
+    risks: Array.isArray(parsed.risks) ? parsed.risks.map(String) : current.risks,
+    catalysts: Array.isArray(parsed.catalysts) ? parsed.catalysts.map(String) : current.catalysts,
+    recommendation: (() => {
+      const r = parsed.recommendation && typeof parsed.recommendation === 'object' ? parsed.recommendation : {};
+      return {
+        verdict: VERDICTS.includes(r.verdict) ? r.verdict : '',
+        confidence: ['low', 'medium', 'high'].includes(r.confidence) ? r.confidence : '',
+        rationale: typeof r.rationale === 'string' ? r.rationale.slice(0, 240) : '',
+        setAt: null, // wird beim Apply gesetzt
+      };
+    })(),
+  };
+
+  return {
+    current,
+    proposed,
     summary: parsed.summary || (parsed.thesis || '').slice(0, 120),
     model: MODEL_COACH,
-  });
+  };
 }
+
+/* =========================================================
+   DD-Diff & Merge
+   ========================================================= */
+
+function diffList(before, after) {
+  const beforeSet = new Set(before || []);
+  const afterSet = new Set(after || []);
+  const added = (after || []).filter((x) => !beforeSet.has(x));
+  const removed = (before || []).filter((x) => !afterSet.has(x));
+  const unchanged = (before || []).filter((x) => afterSet.has(x));
+  return { added, removed, unchanged, changed: added.length > 0 || removed.length > 0 };
+}
+
+function computeDDDiff(current, proposed) {
+  return {
+    thesis: { before: current.thesis || '', after: proposed.thesis || '', changed: (current.thesis || '') !== (proposed.thesis || '') },
+    fundamentals: { before: current.fundamentals || '', after: proposed.fundamentals || '', changed: (current.fundamentals || '') !== (proposed.fundamentals || '') },
+    strengths: diffList(current.strengths, proposed.strengths),
+    risks: diffList(current.risks, proposed.risks),
+    catalysts: diffList(current.catalysts, proposed.catalysts),
+    recommendation: {
+      before: current.recommendation || { verdict: '', confidence: '', rationale: '' },
+      after: proposed.recommendation || { verdict: '', confidence: '', rationale: '' },
+      changed:
+        (current.recommendation?.verdict || '') !== (proposed.recommendation?.verdict || '') ||
+        (current.recommendation?.confidence || '') !== (proposed.recommendation?.confidence || '') ||
+        (current.recommendation?.rationale || '') !== (proposed.recommendation?.rationale || ''),
+    },
+  };
+}
+
+// Wendet pro-Feld-Auswahl auf die DD an und liefert das gemergde Resultat.
+// `accepted` = { thesis: bool, fundamentals: bool, strengths: bool, risks: bool, catalysts: bool, recommendation: bool }
+function mergeDDDiff(current, proposed, accepted) {
+  const next = { ...current };
+  if (accepted.thesis) next.thesis = proposed.thesis;
+  if (accepted.fundamentals) next.fundamentals = proposed.fundamentals;
+  if (accepted.strengths) next.strengths = proposed.strengths;
+  if (accepted.risks) next.risks = proposed.risks;
+  if (accepted.catalysts) next.catalysts = proposed.catalysts;
+  if (accepted.recommendation) {
+    next.recommendation = { ...proposed.recommendation, setAt: Date.now() };
+  }
+  return next;
+}
+
+function summarizeDDDiff(diff, acceptedKeys) {
+  const parts = [];
+  if (acceptedKeys.includes('recommendation') && diff.recommendation.changed) {
+    const before = diff.recommendation.before.verdict || '—';
+    const after = diff.recommendation.after.verdict || '—';
+    parts.push(`recommendation: ${before}→${after}`);
+  }
+  for (const k of ['strengths', 'risks', 'catalysts']) {
+    if (!acceptedKeys.includes(k)) continue;
+    const d = diff[k];
+    const bits = [];
+    if (d.added.length) bits.push(`+${d.added.length} ${k}`);
+    if (d.removed.length) bits.push(`-${d.removed.length} ${k}`);
+    if (bits.length) parts.push(bits.join(' '));
+  }
+  if (acceptedKeys.includes('thesis') && diff.thesis.changed) parts.push('thesis ↻');
+  if (acceptedKeys.includes('fundamentals') && diff.fundamentals.changed) parts.push('fundamentals ↻');
+  return parts.join(' · ') || 'keine Änderungen';
+}
+
+function ddFreshness(dd) {
+  if (!dd || !dd.lastAnalyzedAt) return 'unknown';
+  const days = (Date.now() - dd.lastAnalyzedAt) / 86400000;
+  if (days < 30) return 'fresh';
+  if (days < 90) return 'stale';
+  return 'cold';
+}
+
+const FRESHNESS_COLOR = {
+  fresh: 'text-green-400',
+  stale: 'text-orange-400',
+  cold: 'text-red-400',
+  unknown: 'text-neutral-600',
+};
+const FRESHNESS_BG = {
+  fresh: 'bg-green-400',
+  stale: 'bg-orange-400',
+  cold: 'bg-red-400',
+  unknown: 'bg-neutral-600',
+};
 
 /* =========================================================
    Watchlist-Generator (Themen-Watchlist) & Trending
@@ -757,7 +899,69 @@ const GhostBtn = ({ children, onClick, className = '' }) => (
    Dashboard Tab
    ========================================================= */
 
-function Dashboard({ portfolio, fx, onAssess, onOpenPosition, insights, onOpenInsights }) {
+function VerdictsCard({ portfolio, onOpenByVerdict }) {
+  const counts = useMemo(() => {
+    const m = { sell: 0, reduce: 0, hold: 0, add: 0, watch: 0, none: 0, cold: 0 };
+    for (const p of portfolio) {
+      const v = p.dueDiligence?.recommendation?.verdict || '';
+      if (v && m[v] != null) m[v]++; else m.none++;
+      if (ddFreshness(p.dueDiligence) === 'cold') m.cold++;
+    }
+    return m;
+  }, [portfolio]);
+
+  const rows = [
+    { key: 'sell', label: 'Verkaufen', count: counts.sell, color: 'red' },
+    { key: 'reduce', label: 'Reduzieren', count: counts.reduce, color: 'accent' },
+    { key: 'add', label: 'Nachkaufen', count: counts.add, color: 'green' },
+    { key: 'watch', label: 'Beobachten', count: counts.watch, color: 'blue' },
+    { key: 'hold', label: 'Halten', count: counts.hold, color: 'neutral' },
+  ];
+  const hasAny = rows.some((r) => r.count > 0);
+
+  return (
+    <Card className="p-5">
+      <h3 className="text-white font-semibold mb-3 flex items-center gap-2">
+        <Microscope className="w-4 h-4 text-orange-400" /> AI-Verdicts
+      </h3>
+      {!hasAny ? (
+        <p className="text-neutral-500 text-xs">
+          Noch keine AI-Empfehlungen. Öffne eine Position und klicke „DD aktualisieren".
+        </p>
+      ) : (
+        <button
+          onClick={() => onOpenByVerdict?.()}
+          className="w-full text-left"
+        >
+          <div className="space-y-1.5">
+            {rows.filter((r) => r.count > 0).map((r) => (
+              <div key={r.key} className="flex items-center justify-between text-sm">
+                <span className="flex items-center gap-2">
+                  <Pill color={r.color}>{VERDICT_EMOJI[r.key]} {r.label}</Pill>
+                </span>
+                <span className="text-white font-semibold tabular-nums">{r.count}</span>
+              </div>
+            ))}
+            {counts.none > 0 && (
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-neutral-400">— ohne Verdict</span>
+                <span className="text-neutral-400 tabular-nums">{counts.none}</span>
+              </div>
+            )}
+          </div>
+        </button>
+      )}
+      {counts.cold > 0 && (
+        <p className="text-[11px] text-red-400 mt-3 flex items-center gap-1.5">
+          <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
+          {counts.cold} {counts.cold === 1 ? 'Position' : 'Positionen'} mit DD älter als 90 Tage
+        </p>
+      )}
+    </Card>
+  );
+}
+
+function Dashboard({ portfolio, fx, onAssess, onOpenPosition, onOpenPortfolioByVerdict, insights, onOpenInsights }) {
   const computed = useMemo(
     () => portfolio.map((p) => computePosition(p, fx)),
     [portfolio, fx]
@@ -858,6 +1062,8 @@ function Dashboard({ portfolio, fx, onAssess, onOpenPosition, insights, onOpenIn
         Portfolio-Analyse starten
       </button>
 
+      <VerdictsCard portfolio={portfolio} onOpenByVerdict={onOpenPortfolioByVerdict} />
+
       <InsightsCard insights={insights || []} onOpen={() => onOpenInsights?.()} />
 
       <Card className="p-5">
@@ -929,8 +1135,9 @@ function Dashboard({ portfolio, fx, onAssess, onOpenPosition, insights, onOpenIn
    Portfolio Tab
    ========================================================= */
 
-function PortfolioList({ portfolio, fx, onOpenPosition, onAddPosition }) {
-  const [sort, setSort] = useState('mv');
+function PortfolioList({ portfolio, fx, onOpenPosition, onAddPosition, initialSort = 'mv' }) {
+  const [sort, setSort] = useState(initialSort);
+  useEffect(() => { setSort(initialSort); }, [initialSort]);
   const computed = useMemo(
     () => portfolio.map((p) => computePosition(p, fx)),
     [portfolio, fx]
@@ -940,17 +1147,28 @@ function PortfolioList({ portfolio, fx, onOpenPosition, onAddPosition }) {
     if (sort === 'mv') arr.sort((a, b) => b.mvCHF - a.mvCHF);
     if (sort === 'perf') arr.sort((a, b) => b.plPct - a.plPct);
     if (sort === 'name') arr.sort((a, b) => a.name.localeCompare(b.name));
+    if (sort === 'verdict') {
+      arr.sort((a, b) => {
+        const va = a.dueDiligence?.recommendation?.verdict || '';
+        const vb = b.dueDiligence?.recommendation?.verdict || '';
+        const ra = VERDICT_RANK[va] ?? 5;
+        const rb = VERDICT_RANK[vb] ?? 5;
+        if (ra !== rb) return ra - rb;
+        return b.mvCHF - a.mvCHF;
+      });
+    }
     return arr;
   }, [computed, sort]);
 
   return (
     <div className="px-4 pb-28 pt-4 space-y-3">
       <div className="flex items-center justify-between">
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap">
           {[
             { v: 'mv', l: 'Wert' },
             { v: 'perf', l: 'Perf.' },
             { v: 'name', l: 'Name' },
+            { v: 'verdict', l: 'Verdict' },
           ].map((b) => (
             <button
               key={b.v}
@@ -973,7 +1191,13 @@ function PortfolioList({ portfolio, fx, onOpenPosition, onAddPosition }) {
         </button>
       </div>
 
-      {sorted.map((p) => (
+      {sorted.map((p) => {
+        const verdict = p.dueDiligence?.recommendation?.verdict || '';
+        const fresh = ddFreshness(p.dueDiligence);
+        const ageDays = p.dueDiligence?.lastAnalyzedAt
+          ? Math.round((Date.now() - p.dueDiligence.lastAnalyzedAt) / 86400000)
+          : null;
+        return (
         <button
           key={p.id}
           onClick={() => onOpenPosition(p.id)}
@@ -982,9 +1206,14 @@ function PortfolioList({ portfolio, fx, onOpenPosition, onAddPosition }) {
           <Card className="p-4 active:bg-neutral-800/60 transition">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <p className="text-white font-semibold truncate">{p.name}</p>
                   <Pill>{p.currency}</Pill>
+                  {verdict && (
+                    <Pill color={VERDICT_COLOR[verdict]}>
+                      {VERDICT_EMOJI[verdict]} {VERDICT_LABEL[verdict]}
+                    </Pill>
+                  )}
                 </div>
                 <p className="text-neutral-500 text-xs mt-0.5">
                   {p.ticker} · {p.shares} × {fmtCcy(p.currentPrice, p.currency)}
@@ -997,21 +1226,24 @@ function PortfolioList({ portfolio, fx, onOpenPosition, onAddPosition }) {
                 <PerfText value={p.plPct} />
               </div>
             </div>
-            <div className="flex items-center justify-between mt-3 text-xs text-neutral-500">
+            <div className="flex items-center justify-between mt-3 text-xs text-neutral-500 gap-3">
               <span>Einstand {fmtCcy(p.costBasis, p.currency)}</span>
               <span className={p.plLocal >= 0 ? 'text-green-400' : 'text-red-400'}>
                 {p.plLocal >= 0 ? '+' : ''}
                 {fmtCcy(p.plLocal, p.currency)}
               </span>
-              {p.stopLoss != null && (
-                <span className="flex items-center gap-1 text-orange-400">
-                  <ShieldAlert className="w-3 h-3" /> SL {fmtCcy(p.stopLoss, p.currency)}
-                </span>
-              )}
+              <span
+                className={`flex items-center gap-1 ${FRESHNESS_COLOR[fresh]}`}
+                title={ageDays != null ? `DD vor ${ageDays} Tagen` : 'Noch keine AI-Analyse'}
+              >
+                <span className={`w-1.5 h-1.5 rounded-full ${FRESHNESS_BG[fresh]}`} />
+                DD {ageDays != null ? `${ageDays}d` : '—'}
+              </span>
             </div>
           </Card>
         </button>
-      ))}
+        );
+      })}
 
       {sorted.length === 0 && (
         <Card className="p-8 text-center">
@@ -1089,12 +1321,47 @@ function BulletEditor({ label, items, onChange, placeholder, accent = 'neutral' 
   );
 }
 
+function RecommendationBubble({ rec, model }) {
+  const v = rec?.verdict || '';
+  if (!v) {
+    return (
+      <div className="mb-3 bg-neutral-900/60 border border-dashed border-neutral-800 rounded-xl p-3 text-xs text-neutral-500">
+        Noch keine AI-Empfehlung. Klicke <span className="text-orange-400">„DD aktualisieren"</span>, damit der Coach einen Verdict liefert.
+      </div>
+    );
+  }
+  const setAtDays = rec.setAt ? Math.round((Date.now() - rec.setAt) / 86400000) : null;
+  const accent = {
+    sell: 'bg-red-500/15 border-red-500/40 text-red-300',
+    reduce: 'bg-orange-500/15 border-orange-500/40 text-orange-300',
+    hold: 'bg-neutral-700/40 border-neutral-600 text-neutral-200',
+    add: 'bg-green-500/15 border-green-500/40 text-green-300',
+    watch: 'bg-blue-500/15 border-blue-500/40 text-blue-300',
+  }[v];
+  return (
+    <div className={`mb-3 border rounded-xl p-3 ${accent}`}>
+      <div className="flex items-center justify-between mb-1.5">
+        <p className="font-semibold text-sm">
+          {VERDICT_EMOJI[v]} {VERDICT_LABEL[v].toUpperCase()}
+          {rec.confidence && <span className="text-xs font-normal opacity-80"> · {rec.confidence}</span>}
+        </p>
+        {setAtDays != null && (
+          <span className="text-[10px] opacity-70">
+            vor {setAtDays === 0 ? 'heute' : `${setAtDays}d`}
+          </span>
+        )}
+      </div>
+      {rec.rationale && <p className="text-xs opacity-90">{rec.rationale}</p>}
+    </div>
+  );
+}
+
 function DueDiligenceEditor({ position, onUpdate, apiKey }) {
   const [dd, setDd] = useState(() => ensureDD(position));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [highlightUntil, setHighlightUntil] = useState(0);
+  const [diffState, setDiffState] = useState(null); // { current, proposed, diff, summary, model }
 
   // Sync wenn Position von außen wechselt
   useEffect(() => { setDd(ensureDD(position)); }, [position.id]);
@@ -1109,12 +1376,11 @@ function DueDiligenceEditor({ position, onUpdate, apiKey }) {
     setLoading(true);
     setError('');
     try {
-      const next = await analyzePositionDeep(position, { apiKey });
+      const { current, proposed, summary, model } = await analyzePositionDeep(position, { apiKey });
       // userNotes/tags aus aktuellem (vielleicht ungespeichertem) Local-State holen
-      const merged = { ...next, userNotes: dd.userNotes, tags: dd.tags };
-      setDd(merged);
-      setHighlightUntil(Date.now() + 4000);
-      onUpdate({ ...position, dueDiligence: merged, note: merged.thesis || position.note || '' });
+      const liveCurrent = { ...current, userNotes: dd.userNotes, tags: dd.tags };
+      const diff = computeDDDiff(liveCurrent, proposed);
+      setDiffState({ current: liveCurrent, proposed, diff, summary, model });
     } catch (e) {
       setError(e.message || 'Deep-Analyse fehlgeschlagen.');
     } finally {
@@ -1122,7 +1388,33 @@ function DueDiligenceEditor({ position, onUpdate, apiKey }) {
     }
   };
 
-  const isFresh = highlightUntil > Date.now();
+  const applyDiff = (acceptedKeys) => {
+    if (!diffState) return;
+    const { current, proposed, diff, summary, model } = diffState;
+    const acceptedFlags = {
+      thesis: acceptedKeys.includes('thesis'),
+      fundamentals: acceptedKeys.includes('fundamentals'),
+      strengths: acceptedKeys.includes('strengths'),
+      risks: acceptedKeys.includes('risks'),
+      catalysts: acceptedKeys.includes('catalysts'),
+      recommendation: acceptedKeys.includes('recommendation'),
+    };
+    const merged = mergeDDDiff(current, proposed, acceptedFlags);
+    merged.lastAnalyzedAt = Date.now();
+    merged.lastAnalysisModel = model;
+    const histSummary = summarizeDDDiff(diff, acceptedKeys);
+    const withHistory = appendDDHistory(merged, {
+      ts: Date.now(),
+      source: 'deep',
+      summary: `${histSummary}${summary ? ` — ${summary}` : ''}`.slice(0, 200),
+      model,
+    });
+    setDd(withHistory);
+    onUpdate({ ...position, dueDiligence: withHistory, note: withHistory.thesis || position.note || '' });
+    setDiffState(null);
+  };
+
+  const fresh = ddFreshness(dd);
   const ago = dd.lastAnalyzedAt
     ? Math.max(0, Math.round((Date.now() - dd.lastAnalyzedAt) / 60000))
     : null;
@@ -1133,13 +1425,16 @@ function DueDiligenceEditor({ position, onUpdate, apiKey }) {
     : `AI-Analyse: vor ${Math.round(ago / 60 / 24)} Tagen`;
 
   return (
-    <Card className={`p-4 transition ${isFresh ? 'ring-1 ring-orange-500/40' : ''}`}>
+    <Card className="p-4 transition">
       <div className="flex items-start justify-between mb-3 gap-2">
         <div>
           <h4 className="text-white font-semibold flex items-center gap-2">
             <Sparkles className="w-4 h-4 text-orange-400" /> Due Diligence
           </h4>
-          <p className="text-[11px] text-neutral-500 mt-0.5">{agoLabel}</p>
+          <p className={`text-[11px] mt-0.5 flex items-center gap-1.5 ${FRESHNESS_COLOR[fresh]}`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${FRESHNESS_BG[fresh]}`} />
+            {agoLabel}
+          </p>
         </div>
         <button
           onClick={runDeepAnalysis}
@@ -1148,7 +1443,7 @@ function DueDiligenceEditor({ position, onUpdate, apiKey }) {
           className="flex items-center gap-1.5 bg-orange-500/15 hover:bg-orange-500/25 disabled:opacity-40 text-orange-400 px-3 py-1.5 rounded-lg text-xs font-medium transition shrink-0"
         >
           {loading ? <Spinner size={3} /> : <Sparkles className="w-3.5 h-3.5" />}
-          {loading ? 'Analysiere…' : 'Tief analysieren'}
+          {loading ? 'Analysiere…' : 'DD aktualisieren'}
         </button>
       </div>
 
@@ -1157,6 +1452,8 @@ function DueDiligenceEditor({ position, onUpdate, apiKey }) {
           <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {error}
         </div>
       )}
+
+      <RecommendationBubble rec={dd.recommendation} model={dd.lastAnalysisModel} />
 
       <TextArea
         label="Thesis"
@@ -1241,7 +1538,196 @@ function DueDiligenceEditor({ position, onUpdate, apiKey }) {
       )}
 
       <PrimaryBtn onClick={save}>DD speichern</PrimaryBtn>
+
+      {diffState && (
+        <DDDiffModal
+          diff={diffState.diff}
+          current={diffState.current}
+          proposed={diffState.proposed}
+          onClose={() => setDiffState(null)}
+          onApply={applyDiff}
+        />
+      )}
     </Card>
+  );
+}
+
+/* =========================================================
+   DD Diff Modal
+   ========================================================= */
+
+function DDDiffModal({ diff, current, proposed, onClose, onApply }) {
+  // Pre-select all changed blocks. Unchanged blocks aren't toggleable (no-op).
+  const initial = {
+    thesis: diff.thesis.changed,
+    fundamentals: diff.fundamentals.changed,
+    strengths: diff.strengths.changed,
+    risks: diff.risks.changed,
+    catalysts: diff.catalysts.changed,
+    recommendation: diff.recommendation.changed,
+  };
+  const [accepted, setAccepted] = useState(initial);
+  const anyChanged = Object.values(initial).some(Boolean);
+
+  const toggle = (k) => setAccepted((s) => ({ ...s, [k]: !s[k] }));
+  const setAll = (val) => setAccepted({
+    thesis: val && diff.thesis.changed,
+    fundamentals: val && diff.fundamentals.changed,
+    strengths: val && diff.strengths.changed,
+    risks: val && diff.risks.changed,
+    catalysts: val && diff.catalysts.changed,
+    recommendation: val && diff.recommendation.changed,
+  });
+
+  const acceptedKeys = Object.entries(accepted).filter(([, v]) => v).map(([k]) => k);
+
+  const renderTextDiff = (key, label, d) => {
+    if (!d.changed) {
+      return (
+        <div className="mb-3 opacity-50">
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500 mb-1">{label} (unverändert)</p>
+          <p className="text-xs text-neutral-400 whitespace-pre-wrap">{d.after || '—'}</p>
+        </div>
+      );
+    }
+    return (
+      <div className="mb-3">
+        <div className="flex items-center justify-between mb-1">
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-orange-400">{label} · geändert</p>
+          <label className="flex items-center gap-1.5 text-[11px] text-neutral-400 select-none">
+            <input type="checkbox" checked={!!accepted[key]} onChange={() => toggle(key)} className="accent-orange-500" />
+            übernehmen
+          </label>
+        </div>
+        <div className="bg-red-950/20 border border-red-500/20 rounded-lg p-2 mb-1">
+          <p className="text-[10px] text-red-400 mb-0.5">vorher</p>
+          <p className="text-xs text-neutral-300 whitespace-pre-wrap">{d.before || '—'}</p>
+        </div>
+        <div className="bg-green-950/20 border border-green-500/20 rounded-lg p-2">
+          <p className="text-[10px] text-green-400 mb-0.5">nachher</p>
+          <p className="text-xs text-neutral-200 whitespace-pre-wrap">{d.after || '—'}</p>
+        </div>
+      </div>
+    );
+  };
+
+  const renderListDiff = (key, label, d) => {
+    if (!d.changed && d.unchanged.length === 0) {
+      return (
+        <div className="mb-3 opacity-50">
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500 mb-1">{label} (leer)</p>
+        </div>
+      );
+    }
+    if (!d.changed) {
+      return (
+        <div className="mb-3 opacity-50">
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500 mb-1">{label} (unverändert · {d.unchanged.length})</p>
+          <ul className="text-xs text-neutral-400 space-y-0.5">
+            {d.unchanged.map((it, i) => <li key={i}>• {it}</li>)}
+          </ul>
+        </div>
+      );
+    }
+    return (
+      <div className="mb-3">
+        <div className="flex items-center justify-between mb-1">
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-orange-400">
+            {label} · +{d.added.length} / −{d.removed.length}
+          </p>
+          <label className="flex items-center gap-1.5 text-[11px] text-neutral-400 select-none">
+            <input type="checkbox" checked={!!accepted[key]} onChange={() => toggle(key)} className="accent-orange-500" />
+            übernehmen
+          </label>
+        </div>
+        <ul className="text-xs space-y-0.5">
+          {d.added.map((it, i) => (
+            <li key={`a${i}`} className="text-green-300"><span className="text-green-500">+</span> {it}</li>
+          ))}
+          {d.removed.map((it, i) => (
+            <li key={`r${i}`} className="text-red-400 line-through opacity-70"><span>−</span> {it}</li>
+          ))}
+          {d.unchanged.map((it, i) => (
+            <li key={`u${i}`} className="text-neutral-500">• {it}</li>
+          ))}
+        </ul>
+      </div>
+    );
+  };
+
+  const renderRecommendationDiff = () => {
+    const d = diff.recommendation;
+    const before = d.before;
+    const after = d.after;
+    if (!d.changed) {
+      return (
+        <div className="mb-3 opacity-50">
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500 mb-1">Verdict (unverändert)</p>
+          <p className="text-xs text-neutral-400">{after.verdict ? `${VERDICT_EMOJI[after.verdict]} ${VERDICT_LABEL[after.verdict]}` : '—'}</p>
+        </div>
+      );
+    }
+    const colorClass = {
+      sell: 'border-red-500/40 bg-red-500/10',
+      reduce: 'border-orange-500/40 bg-orange-500/10',
+      hold: 'border-neutral-600 bg-neutral-700/30',
+      add: 'border-green-500/40 bg-green-500/10',
+      watch: 'border-blue-500/40 bg-blue-500/10',
+    }[after.verdict] || 'border-neutral-700 bg-neutral-900/40';
+    return (
+      <div className={`mb-3 border rounded-xl p-3 ${colorClass}`}>
+        <div className="flex items-center justify-between mb-2">
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-orange-300">Verdict · geändert</p>
+          <label className="flex items-center gap-1.5 text-[11px] text-neutral-200 select-none">
+            <input type="checkbox" checked={!!accepted.recommendation} onChange={() => toggle('recommendation')} className="accent-orange-500" />
+            übernehmen
+          </label>
+        </div>
+        <p className="text-sm text-neutral-200 mb-1">
+          {before.verdict ? `${VERDICT_EMOJI[before.verdict]} ${VERDICT_LABEL[before.verdict]}` : '— kein Verdict —'}
+          {' '}<span className="text-neutral-500">→</span>{' '}
+          <span className="font-semibold">{after.verdict ? `${VERDICT_EMOJI[after.verdict]} ${VERDICT_LABEL[after.verdict]}` : '—'}</span>
+          {after.confidence && <span className="text-xs text-neutral-400"> · {after.confidence}</span>}
+        </p>
+        {after.rationale && <p className="text-xs text-neutral-300">{after.rationale}</p>}
+      </div>
+    );
+  };
+
+  return (
+    <Modal
+      open={true}
+      onClose={onClose}
+      title="DD-Vorschlag prüfen"
+      footer={
+        <div className="space-y-2">
+          {!anyChanged && (
+            <p className="text-xs text-neutral-400 text-center">Keine Änderungen vorgeschlagen.</p>
+          )}
+          <div className="grid grid-cols-2 gap-2">
+            <GhostBtn onClick={onClose}>Verwerfen</GhostBtn>
+            <PrimaryBtn
+              onClick={() => onApply(acceptedKeys)}
+              disabled={acceptedKeys.length === 0}
+            >
+              {acceptedKeys.length === 0 ? 'Nichts gewählt' : `${acceptedKeys.length} ${acceptedKeys.length === 1 ? 'Block' : 'Blöcke'} anwenden`}
+            </PrimaryBtn>
+          </div>
+          <div className="flex justify-center gap-3 text-[11px] text-neutral-500">
+            <button onClick={() => setAll(true)} className="hover:text-neutral-200">Alle ankreuzen</button>
+            <span>·</span>
+            <button onClick={() => setAll(false)} className="hover:text-neutral-200">Keine</button>
+          </div>
+        </div>
+      }
+    >
+      {renderRecommendationDiff()}
+      {renderTextDiff('thesis', 'Thesis', diff.thesis)}
+      {renderListDiff('risks', 'Risiken', diff.risks)}
+      {renderListDiff('strengths', 'Stärken', diff.strengths)}
+      {renderListDiff('catalysts', 'Catalysts', diff.catalysts)}
+      {renderTextDiff('fundamentals', 'Fundamentals', diff.fundamentals)}
+    </Modal>
   );
 }
 
@@ -2369,6 +2855,7 @@ function WatchlistDDModal({ item, apiKey, onClose, onUpdate }) {
   const [dd, setDd] = useState(() => ensureDD({ dueDiligence: item.dueDiligence, note: item.thesis }));
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
+  const [diffState, setDiffState] = useState(null);
   const setField = (k, v) => setDd((d) => ({ ...d, [k]: v }));
 
   const runDeep = async () => {
@@ -2384,13 +2871,40 @@ function WatchlistDDModal({ item, apiKey, onClose, onUpdate }) {
         currentPrice: item.triggerPrice || 0,
         dueDiligence: dd,
       };
-      const next = await analyzePositionDeep(pseudoPosition, { apiKey });
-      setDd({ ...next, userNotes: dd.userNotes, tags: dd.tags });
+      const { current, proposed, summary, model } = await analyzePositionDeep(pseudoPosition, { apiKey });
+      const liveCurrent = { ...current, userNotes: dd.userNotes, tags: dd.tags };
+      const diff = computeDDDiff(liveCurrent, proposed);
+      setDiffState({ current: liveCurrent, proposed, diff, summary, model });
     } catch (e) {
       setErr(e.message || 'Deep-Analyse fehlgeschlagen.');
     } finally {
       setLoading(false);
     }
+  };
+
+  const applyDiff = (acceptedKeys) => {
+    if (!diffState) return;
+    const { current, proposed, diff, summary, model } = diffState;
+    const acceptedFlags = {
+      thesis: acceptedKeys.includes('thesis'),
+      fundamentals: acceptedKeys.includes('fundamentals'),
+      strengths: acceptedKeys.includes('strengths'),
+      risks: acceptedKeys.includes('risks'),
+      catalysts: acceptedKeys.includes('catalysts'),
+      recommendation: acceptedKeys.includes('recommendation'),
+    };
+    const merged = mergeDDDiff(current, proposed, acceptedFlags);
+    merged.lastAnalyzedAt = Date.now();
+    merged.lastAnalysisModel = model;
+    const histSummary = summarizeDDDiff(diff, acceptedKeys);
+    const withHistory = appendDDHistory(merged, {
+      ts: Date.now(),
+      source: 'deep',
+      summary: `${histSummary}${summary ? ` — ${summary}` : ''}`.slice(0, 200),
+      model,
+    });
+    setDd(withHistory);
+    setDiffState(null);
   };
 
   const save = () => {
@@ -2410,7 +2924,7 @@ function WatchlistDDModal({ item, apiKey, onClose, onUpdate }) {
             className="flex items-center gap-1.5 bg-orange-500/15 hover:bg-orange-500/25 disabled:opacity-40 text-orange-400 px-3 py-1.5 rounded-lg text-xs font-medium transition shrink-0"
           >
             {loading ? <Spinner size={3} /> : <Sparkles className="w-3.5 h-3.5" />}
-            {loading ? 'Analysiere…' : 'Tief analysieren'}
+            {loading ? 'Analysiere…' : 'DD aktualisieren'}
           </button>
         </div>
         {err && (
@@ -2418,6 +2932,7 @@ function WatchlistDDModal({ item, apiKey, onClose, onUpdate }) {
             <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {err}
           </div>
         )}
+        <RecommendationBubble rec={dd.recommendation} model={dd.lastAnalysisModel} />
         <TextArea label="Thesis" value={dd.thesis} onChange={(v) => setField('thesis', v)} rows={2} placeholder="Warum interessant?" />
         <BulletEditor label="Stärken" items={dd.strengths} onChange={(v) => setField('strengths', v)} accent="green" />
         <BulletEditor label="Risiken" items={dd.risks} onChange={(v) => setField('risks', v)} accent="red" />
@@ -2426,6 +2941,15 @@ function WatchlistDDModal({ item, apiKey, onClose, onUpdate }) {
         <TextArea label="Eigene Notizen" value={dd.userNotes} onChange={(v) => setField('userNotes', v)} rows={2} />
         <PrimaryBtn onClick={save}>DD speichern</PrimaryBtn>
       </Card>
+      {diffState && (
+        <DDDiffModal
+          diff={diffState.diff}
+          current={diffState.current}
+          proposed={diffState.proposed}
+          onClose={() => setDiffState(null)}
+          onApply={applyDiff}
+        />
+      )}
     </Modal>
   );
 }
@@ -3559,6 +4083,7 @@ export default function App() {
   const [insights, setInsights] = useState([]);
   const [settings, setSettingsState] = useState({ fx: DEFAULT_FX });
   const [openPositionId, setOpenPositionId] = useState(null);
+  const [portfolioInitialSort, setPortfolioInitialSort] = useState('mv');
   const [showAddPosition, setShowAddPosition] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -3635,7 +4160,7 @@ export default function App() {
     let applied = false;
     setPortfolio((arr) => arr.map((p) => {
       if (p.ticker !== update.ticker) return p;
-      if (update.field === 'userNotes' || update.field === 'tags') return p; // AI darf das nicht
+      if (update.field === 'userNotes' || update.field === 'tags' || update.field === 'recommendation') return p; // AI darf das nicht / recommendation läuft nur über Diff-Modal
       const dd = ensureDD(p);
       let nextField;
       if (DD_LIST_FIELDS.includes(update.field)) {
@@ -3663,7 +4188,7 @@ export default function App() {
     let applied = false;
     setWatchlist((arr) => arr.map((w) => {
       if (w.ticker !== update.ticker) return w;
-      if (update.field === 'userNotes' || update.field === 'tags') return w;
+      if (update.field === 'userNotes' || update.field === 'tags' || update.field === 'recommendation') return w;
       const dd = ensureDD(w);
       let nextField;
       if (DD_LIST_FIELDS.includes(update.field)) {
@@ -3821,12 +4346,14 @@ export default function App() {
             onAssess={triggerAssessment}
             onOpenPosition={(id) => setOpenPositionId(id)}
             onOpenInsights={() => setShowInsights(true)}
+            onOpenPortfolioByVerdict={() => { setPortfolioInitialSort('verdict'); setTab('portfolio'); }}
           />
         )}
         {tab === 'portfolio' && (
           <PortfolioList
             portfolio={portfolio}
             fx={fx}
+            initialSort={portfolioInitialSort}
             onOpenPosition={(id) => setOpenPositionId(id)}
             onAddPosition={() => setShowAddPosition(true)}
           />
