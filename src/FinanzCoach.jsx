@@ -84,43 +84,259 @@ const storage = {
 };
 
 /* =========================================================
+   Market-Data: Finnhub + Yahoo (CORS-Proxy) Fallback
+   ========================================================= */
+
+const QUOTE_TTL_MS = 60 * 1000;
+const quoteCache = new Map(); // ticker(uppercase) -> { ts, data }
+
+// Schweizer/Europäische Suffixe für Yahoo-Symbol-Resolution.
+// Wenn der User "NOVN" eingibt, probieren wir auch "NOVN.SW" etc.
+const EXCHANGE_SUFFIXES = ['', '.SW', '.DE', '.PA', '.L', '.AS', '.MI', '.MC', '.ST', '.HE', '.OL', '.CO', '.VI'];
+
+function normalizeTicker(input) {
+  return String(input || '').trim().toUpperCase();
+}
+
+async function fetchFinnhubQuote(ticker, apiKey) {
+  if (!apiKey) return null;
+  try {
+    const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(ticker)}&token=${apiKey}`;
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const d = await r.json();
+    // Finnhub returns { c: current, pc: prevClose, ... } – c=0 bedeutet unbekannt
+    if (!d || !d.c) return null;
+    return { price: d.c, prevClose: d.pc || null, source: 'finnhub' };
+  } catch { return null; }
+}
+
+async function fetchFinnhubProfile(ticker, apiKey) {
+  if (!apiKey) return null;
+  try {
+    const url = `https://finnhub.io/api/v1/stock/profile2?symbol=${encodeURIComponent(ticker)}&token=${apiKey}`;
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const d = await r.json();
+    if (!d || !d.name) return null;
+    return {
+      name: d.name,
+      currency: d.currency,
+      exchange: d.exchange,
+      industry: d.finnhubIndustry,
+    };
+  } catch { return null; }
+}
+
+async function fetchYahooViaProxy(ticker) {
+  // Yahoo Finance v8 chart endpoint via corsproxy.io (kein Key, internationale Coverage).
+  // Wir probieren mehrere Exchange-Suffixe, falls der reine Ticker (z.B. NOVN) nicht trifft.
+  const candidates = ticker.includes('.') ? [ticker] : EXCHANGE_SUFFIXES.map((s) => ticker + s);
+  for (const sym of candidates) {
+    try {
+      const target = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=2d`;
+      const r = await fetch(`https://corsproxy.io/?${encodeURIComponent(target)}`);
+      if (!r.ok) continue;
+      const d = await r.json();
+      const result = d?.chart?.result?.[0];
+      if (!result?.meta?.regularMarketPrice) continue;
+      const m = result.meta;
+      return {
+        price: m.regularMarketPrice,
+        prevClose: m.previousClose || m.chartPreviousClose || null,
+        currency: m.currency,
+        exchange: m.exchangeName,
+        name: m.longName || m.shortName || null,
+        resolvedSymbol: sym,
+        source: 'yahoo',
+      };
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
+// Holt Quote + (optional) Profil. Reihenfolge: Finnhub-Quote → bei Misserfolg Yahoo.
+// Profil wird nur fürs Enrichment (neue Position) benötigt – nicht für reines Refresh.
+async function getMarketData(ticker, finnhubKey, { withProfile = false } = {}) {
+  const t = normalizeTicker(ticker);
+  const cached = quoteCache.get(t);
+  if (cached && Date.now() - cached.ts < QUOTE_TTL_MS && !withProfile) return cached.data;
+
+  let quote = await fetchFinnhubQuote(t, finnhubKey);
+  let profile = withProfile ? await fetchFinnhubProfile(t, finnhubKey) : null;
+  let yahoo = null;
+
+  // Fallback: Yahoo für non-US oder wenn Finnhub leer
+  if (!quote || (withProfile && !profile)) {
+    yahoo = await fetchYahooViaProxy(t);
+  }
+
+  const data = {
+    price: quote?.price ?? yahoo?.price ?? null,
+    prevClose: quote?.prevClose ?? yahoo?.prevClose ?? null,
+    name: profile?.name ?? yahoo?.name ?? null,
+    currency: profile?.currency ?? yahoo?.currency ?? null,
+    exchange: profile?.exchange ?? yahoo?.exchange ?? null,
+    industry: profile?.industry ?? null,
+    resolvedSymbol: yahoo?.resolvedSymbol ?? t,
+    source: quote ? 'finnhub' : (yahoo ? 'yahoo' : null),
+    fetchedAt: Date.now(),
+  };
+
+  if (data.price != null) quoteCache.set(t, { ts: Date.now(), data });
+  return data;
+}
+
+/* =========================================================
    AI Call (Anthropic)
    ========================================================= */
 
-async function callClaude({ system, messages, apiKey }) {
+const MODEL_COACH = 'claude-sonnet-4-6';
+const MODEL_ENRICH = 'claude-haiku-4-5-20251001';
+
+async function callClaude({
+  system,
+  messages,
+  apiKey,
+  model,
+  maxTokens = 2000,
+  tools,
+  betas,
+}) {
   // Falls Artifact-Runtime ein window.claude.complete bereitstellt, nutze es
   if (typeof window !== 'undefined' && window.claude && typeof window.claude.complete === 'function') {
+    const systemText = typeof system === 'string'
+      ? system
+      : (Array.isArray(system) ? system.map((b) => b.text || '').join('\n\n') : '');
     const transcript = messages
       .map((m) => `${m.role === 'user' ? 'USER' : 'ASSISTANT'}: ${m.content}`)
       .join('\n\n');
-    const prompt = `${system}\n\n${transcript}\n\nASSISTANT:`;
+    const prompt = `${systemText}\n\n${transcript}\n\nASSISTANT:`;
     const out = await window.claude.complete(prompt);
     return typeof out === 'string' ? out : (out?.completion || '');
   }
   if (!apiKey) {
     throw new Error('Kein Anthropic API-Key gesetzt. Trag ihn in den Einstellungen (Zahnrad oben rechts) ein.');
   }
+  const headers = {
+    'Content-Type': 'application/json',
+    'x-api-key': apiKey,
+    'anthropic-version': '2023-06-01',
+    'anthropic-dangerous-direct-browser-access': 'true',
+  };
+  if (betas && betas.length) headers['anthropic-beta'] = betas.join(',');
+
+  const body = {
+    model: model || MODEL_COACH,
+    max_tokens: maxTokens,
+    system,
+    messages,
+  };
+  if (tools && tools.length) body.tools = tools;
+
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true',
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 2000,
-      system,
-      messages,
-    }),
+    headers,
+    body: JSON.stringify(body),
   });
   if (!resp.ok) {
     const txt = await resp.text().catch(() => '');
     throw new Error(`API ${resp.status}: ${txt.slice(0, 200)}`);
   }
   const data = await resp.json();
-  return data?.content?.[0]?.text || '';
+  // Mit web_search können mehrere content-Blöcke kommen (text, server_tool_use,
+  // web_search_tool_result). Wir konkatenieren nur Text.
+  const text = (data?.content || [])
+    .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text)
+    .join('\n')
+    .trim();
+  return text;
+}
+
+/* =========================================================
+   Draft-Enrichment: 1 AI-Call für N Drafts
+   ========================================================= */
+
+async function enrichDrafts(drafts, { apiKey, finnhubKey, onProgress } = {}) {
+  onProgress?.('Hole Live-Kurse…');
+
+  // 1) Parallel Marktdaten pro Draft (Finnhub + Yahoo-Fallback)
+  const market = await Promise.all(
+    drafts.map((d) => getMarketData(d.ticker, finnhubKey, { withProfile: true }).catch(() => null))
+  );
+
+  const merged = drafts.map((d, i) => {
+    const m = market[i] || {};
+    return {
+      tempId: d.tempId,
+      ticker: normalizeTicker(d.ticker),
+      shares: d.shares,
+      costBasis: d.costBasis,
+      currency: d.currency || m.currency || 'USD',
+      currentPrice: m.price ?? d.costBasis,
+      name: m.name || normalizeTicker(d.ticker),
+      industry: m.industry || null,
+      exchange: m.exchange || null,
+      source: m.source || null,
+    };
+  });
+
+  // 2) Ein einziger Haiku-Call klassifiziert alle Drafts auf einmal
+  let aiResult = [];
+  if (apiKey) {
+    onProgress?.('Klassifiziere mit AI…');
+    try {
+      const compactInput = merged.map((m, idx) => ({
+        idx,
+        ticker: m.ticker,
+        name: m.name,
+        industry: m.industry,
+        exchange: m.exchange,
+      }));
+      const system = `Du klassifizierst Aktien/ETFs/Funds für ein Schweizer Portfolio-Tool. Antworte AUSSCHLIESSLICH mit einem validen JSON-Array. Kein Markdown, keine Erklärung, kein Text drumherum.
+
+Format pro Eintrag:
+{"idx": <number>, "assetClass": "<eine der erlaubten>", "thesis": "<1 Satz, max 90 Zeichen>"}
+
+Erlaubte assetClass-Werte (exakt einer): ${ASSET_CLASSES.join(' | ')}
+
+Wähle den passendsten Wert basierend auf ticker/name/industry. Bei Unsicherheit "Sonstige".`;
+      const userMsg = `Klassifiziere diese Positionen:\n${JSON.stringify(compactInput)}`;
+      const reply = await callClaude({
+        system,
+        messages: [{ role: 'user', content: userMsg }],
+        apiKey,
+        model: MODEL_ENRICH,
+        maxTokens: 800,
+      });
+      const match = reply.match(/\[[\s\S]*\]/);
+      if (match) aiResult = JSON.parse(match[0]);
+    } catch (e) {
+      console.warn('Enrichment-AI fehlgeschlagen:', e);
+    }
+  }
+
+  // 3) Finale Position-Objekte zusammenbauen
+  const today = new Date().toISOString().slice(0, 10);
+  return merged.map((m, i) => {
+    const ai = aiResult.find((x) => x.idx === i) || {};
+    return {
+      id: uid(),
+      ticker: m.ticker,
+      name: m.name,
+      assetClass: ASSET_CLASSES.includes(ai.assetClass) ? ai.assetClass : 'Sonstige',
+      shares: m.shares,
+      costBasis: m.costBasis,
+      currentPrice: m.currentPrice,
+      currency: m.currency,
+      purchaseDate: today,
+      note: ai.thesis || '',
+      stopLoss: null,
+      lastQuoteAt: m.source ? Date.now() : null,
+      quoteSource: m.source,
+    };
+  });
 }
 
 /* =========================================================
@@ -707,68 +923,159 @@ function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onL
    Add Position Modal
    ========================================================= */
 
-function AddPositionModal({ open, onClose, onAdd }) {
-  const [form, setForm] = useState({
-    ticker: '',
-    name: '',
-    assetClass: ASSET_CLASSES[0],
-    shares: '',
-    costBasis: '',
-    currentPrice: '',
-    currency: 'CHF',
-    purchaseDate: new Date().toISOString().slice(0, 10),
-    note: '',
-  });
+function AddPositionModal({ open, onClose, onAddMany, apiKey, finnhubKey }) {
+  const [form, setForm] = useState({ ticker: '', shares: '', costBasis: '', currency: 'auto' });
+  const [drafts, setDrafts] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState('');
+  const [error, setError] = useState('');
 
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
 
-  const submit = () => {
-    if (!form.ticker || !form.name || !form.shares || !form.costBasis) return;
+  const addDraft = () => {
+    setError('');
+    const ticker = form.ticker.trim();
     const shares = parseFloat(form.shares);
     const costBasis = parseFloat(form.costBasis);
-    const currentPrice = parseFloat(form.currentPrice) || costBasis;
-    onAdd({
-      id: uid(),
-      ticker: form.ticker.toUpperCase(),
-      name: form.name,
-      assetClass: form.assetClass,
-      shares,
-      costBasis,
-      currentPrice,
-      currency: form.currency,
-      purchaseDate: form.purchaseDate,
-      note: form.note,
-      stopLoss: null,
-    });
-    onClose();
-    setForm({
-      ticker: '', name: '', assetClass: ASSET_CLASSES[0], shares: '', costBasis: '',
-      currentPrice: '', currency: 'CHF', purchaseDate: new Date().toISOString().slice(0, 10), note: '',
-    });
+    if (!ticker || !Number.isFinite(shares) || shares <= 0 || !Number.isFinite(costBasis) || costBasis <= 0) {
+      setError('Ticker, Anzahl und Einstand sind Pflicht.');
+      return;
+    }
+    setDrafts((arr) => [
+      ...arr,
+      {
+        tempId: uid(),
+        ticker: ticker.toUpperCase(),
+        shares,
+        costBasis,
+        currency: form.currency === 'auto' ? null : form.currency,
+      },
+    ]);
+    setForm({ ticker: '', shares: '', costBasis: '', currency: form.currency });
   };
+
+  const removeDraft = (id) => setDrafts((arr) => arr.filter((d) => d.tempId !== id));
+
+  const closeAndReset = () => {
+    if (loading) return;
+    setDrafts([]);
+    setForm({ ticker: '', shares: '', costBasis: '', currency: 'auto' });
+    setError('');
+    onClose();
+  };
+
+  const commit = async () => {
+    if (drafts.length === 0) return;
+    setLoading(true);
+    setError('');
+    try {
+      const positions = await enrichDrafts(drafts, { apiKey, finnhubKey, onProgress: setProgress });
+      onAddMany(positions);
+      setDrafts([]);
+      setForm({ ticker: '', shares: '', costBasis: '', currency: 'auto' });
+      onClose();
+    } catch (e) {
+      setError(e.message || 'Konnte Drafts nicht vervollständigen.');
+    } finally {
+      setLoading(false);
+      setProgress('');
+    }
+  };
+
+  const canAddDraft = form.ticker.trim() && form.shares && form.costBasis;
 
   return (
     <Modal
       open={open}
-      onClose={onClose}
-      title="Neue Position"
-      footer={<PrimaryBtn onClick={submit}>Hinzufügen</PrimaryBtn>}
+      onClose={closeAndReset}
+      title="Neue Positionen"
+      footer={
+        <div className="space-y-2">
+          {error && (
+            <div className="text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {error}
+            </div>
+          )}
+          {loading && (
+            <div className="flex items-center justify-center gap-2 text-orange-400 text-sm py-1">
+              <Spinner size={4} />
+              <span>{progress || 'Vervollständige…'}</span>
+            </div>
+          )}
+          <PrimaryBtn onClick={commit} disabled={loading || drafts.length === 0}>
+            {drafts.length === 0
+              ? 'Erst Drafts hinzufügen'
+              : `${drafts.length} ${drafts.length === 1 ? 'Position' : 'Positionen'} mit AI vervollständigen`}
+          </PrimaryBtn>
+        </div>
+      }
     >
-      <div className="grid grid-cols-2 gap-3">
-        <TextField label="Ticker" value={form.ticker} onChange={(v) => set('ticker', v)} placeholder="NOVN" />
-        <TextField label="Name" value={form.name} onChange={(v) => set('name', v)} placeholder="Novartis" />
+      <div className="bg-neutral-900/60 border border-neutral-800 rounded-xl p-3 mb-3">
+        <p className="text-xs text-neutral-400 mb-3">
+          Nur das Nötigste eingeben. Name, Kurs, Asset-Klasse & These holt die AI per Yahoo/Finnhub-Daten in einem Rutsch.
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <TextField
+            label="Ticker"
+            value={form.ticker}
+            onChange={(v) => set('ticker', v)}
+            placeholder="NOVN, AAPL, ROG.SW"
+          />
+          <SelectField
+            label="Währung"
+            value={form.currency}
+            onChange={(v) => set('currency', v)}
+            options={['auto', ...CURRENCIES]}
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <TextField
+            label="Anzahl"
+            type="number"
+            step="0.0001"
+            value={form.shares}
+            onChange={(v) => set('shares', v)}
+          />
+          <TextField
+            label="Einstand / Stück"
+            type="number"
+            step="0.01"
+            value={form.costBasis}
+            onChange={(v) => set('costBasis', v)}
+          />
+        </div>
+        <button
+          onClick={addDraft}
+          disabled={!canAddDraft || loading}
+          className="w-full mt-1 bg-neutral-800 hover:bg-neutral-700 disabled:opacity-40 text-white font-medium py-2 rounded-lg text-sm flex items-center justify-center gap-1 transition"
+        >
+          <Plus className="w-4 h-4" /> Zu Drafts hinzufügen
+        </button>
       </div>
-      <SelectField label="Asset-Klasse" value={form.assetClass} onChange={(v) => set('assetClass', v)} options={ASSET_CLASSES} />
-      <div className="grid grid-cols-2 gap-3">
-        <TextField label="Anzahl" type="number" step="0.01" value={form.shares} onChange={(v) => set('shares', v)} />
-        <SelectField label="Währung" value={form.currency} onChange={(v) => set('currency', v)} options={CURRENCIES} />
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        <TextField label="Einstandskurs" type="number" step="0.01" value={form.costBasis} onChange={(v) => set('costBasis', v)} />
-        <TextField label="Aktueller Kurs" type="number" step="0.01" value={form.currentPrice} onChange={(v) => set('currentPrice', v)} placeholder="optional" />
-      </div>
-      <TextField label="Kaufdatum" type="date" value={form.purchaseDate} onChange={(v) => set('purchaseDate', v)} />
-      <TextArea label="Notiz / These" value={form.note} onChange={(v) => set('note', v)} />
+
+      {drafts.length > 0 && (
+        <div className="space-y-2 mb-2">
+          <p className="text-xs text-neutral-400 font-medium px-1">
+            Drafts ({drafts.length}) – werden in einem AI-Call vervollständigt
+          </p>
+          {drafts.map((d) => (
+            <div
+              key={d.tempId}
+              className="flex items-center justify-between bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2"
+            >
+              <div className="min-w-0">
+                <p className="text-white text-sm font-medium">{d.ticker}</p>
+                <p className="text-neutral-500 text-xs">
+                  {d.shares} × {d.costBasis} {d.currency || 'auto'}
+                </p>
+              </div>
+              <button onClick={() => removeDraft(d.tempId)} disabled={loading}>
+                <X className="w-4 h-4 text-neutral-500 hover:text-red-400" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
     </Modal>
   );
 }
@@ -1146,6 +1453,8 @@ function CoachTab({ portfolio, trades, watchlist, fx, apiKey, chatHistory, setCh
     const totalCHF = portfolio.reduce((s, p) => s + toCHF(p.shares * p.currentPrice, p.currency, fx), 0);
     return `Du bist ein erfahrener, ehrlicher Finanzberater für einen Schweizer Privatanleger. Du sprichst Deutsch (Du-Form). Du bist direkt, datenbasiert und nicht zu vorsichtig. Du erinnerst den User an Disziplin (Stop-Losses, Gewinnmitnahmen, Diversifikation). Du schmeichelst nicht. Du erwähnst Steuer-Aspekte der Schweiz wenn relevant (keine Kapitalgewinnsteuer privat). Du kannst Aktien zur Watchlist vorschlagen mit dem Format: [WATCHLIST_VORSCHLAG: TICKER | NAME | THESE]. Nutze dieses Format wörtlich, wenn du eine konkrete Aktie empfiehlst aufzunehmen.
 
+TOOLS: Du hast Zugriff auf das web_search-Tool. Nutze es SPARSAM – nur wenn der User explizit nach aktuellen News, Earnings, Analyst-Calls oder tagesaktuellen Ereignissen fragt. Für reine Portfolio-Analyse (Klumpenrisiken, Diversifikation, Sektoren-Mix) brauchst du KEINE Web-Suche – dafür reichen die Portfolio-Daten unten. Token-Disziplin.
+
 KONTEXT:
 Total Portfolio CHF: ${Math.round(totalCHF)}
 FX-Raten (in CHF): ${JSON.stringify(fx)}
@@ -1175,6 +1484,8 @@ ${JSON.stringify(watchlist, null, 2)}`;
         system: buildSystem(),
         messages: apiMessages,
         apiKey,
+        model: MODEL_COACH,
+        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
       });
       setChatHistory([...next, { role: 'assistant', content: reply, ts: Date.now() }]);
     } catch (e) {
@@ -1360,15 +1671,18 @@ function SuggestionCard({ suggestion, onAccept }) {
 function SettingsModal({ open, onClose, settings, setSettings, onReset }) {
   const [fx, setFx] = useState(settings.fx);
   const [apiKey, setApiKey] = useState(settings.apiKey || '');
+  const [finnhubKey, setFinnhubKey] = useState(settings.finnhubKey || '');
   useEffect(() => {
     setFx(settings.fx);
     setApiKey(settings.apiKey || '');
-  }, [settings.fx, settings.apiKey, open]);
+    setFinnhubKey(settings.finnhubKey || '');
+  }, [settings.fx, settings.apiKey, settings.finnhubKey, open]);
 
   const save = () => {
     setSettings({
       ...settings,
       apiKey: apiKey.trim(),
+      finnhubKey: finnhubKey.trim(),
       fx: {
         CHF: 1,
         USD: parseFloat(fx.USD) || DEFAULT_FX.USD,
@@ -1392,6 +1706,14 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset }) {
           Wird lokal gespeichert und direkt an api.anthropic.com gesendet. Hol dir einen Key auf console.anthropic.com.
         </p>
         <TextField label="sk-ant-…" type="password" value={apiKey} onChange={setApiKey} placeholder="sk-ant-api03-…" />
+      </Card>
+      <Card className="p-4 mb-3">
+        <h4 className="text-white font-semibold mb-2">Finnhub API-Key (Live-Kurse)</h4>
+        <p className="text-neutral-400 text-xs mb-2">
+          Optional, aber empfohlen. Free-Plan auf finnhub.io (60 Calls/Min, hauptsächlich US-Aktien).
+          Schweizer/EU-Aktien werden automatisch über Yahoo (corsproxy.io) geholt.
+        </p>
+        <TextField label="Finnhub Token" type="password" value={finnhubKey} onChange={setFinnhubKey} placeholder="cv…" />
       </Card>
       <Card className="p-4 mb-3">
         <h4 className="text-white font-semibold mb-2">FX-Raten (zu CHF)</h4>
@@ -1481,14 +1803,31 @@ function BottomNav({ tab, setTab }) {
    Top Bar
    ========================================================= */
 
-function TopBar({ title, onSettings }) {
+function TopBar({ title, onSettings, onRefresh, refreshing, lastRefresh }) {
+  const ago = lastRefresh ? Math.max(0, Math.round((Date.now() - lastRefresh) / 60000)) : null;
   return (
     <header className="sticky top-0 z-30 bg-black/95 backdrop-blur border-b border-neutral-900 pt-[max(env(safe-area-inset-top),0.5rem)]">
       <div className="flex items-center justify-between px-4 py-3 max-w-md mx-auto">
-        <h1 className="text-white font-bold text-lg">{title}</h1>
-        <IconBtn onClick={onSettings}>
-          <SettingsIcon className="w-5 h-5 text-neutral-400" />
-        </IconBtn>
+        <div className="min-w-0">
+          <h1 className="text-white font-bold text-lg">{title}</h1>
+          {lastRefresh && (
+            <p className="text-[10px] text-neutral-500 leading-tight">
+              Kurse {ago === 0 ? 'gerade' : `vor ${ago} Min`} aktualisiert
+            </p>
+          )}
+        </div>
+        <div className="flex items-center gap-1">
+          {onRefresh && (
+            <IconBtn onClick={() => onRefresh(true)}>
+              {refreshing
+                ? <Loader2 className="w-5 h-5 text-orange-400 animate-spin" />
+                : <RotateCcw className="w-5 h-5 text-neutral-400" />}
+            </IconBtn>
+          )}
+          <IconBtn onClick={onSettings}>
+            <SettingsIcon className="w-5 h-5 text-neutral-400" />
+          </IconBtn>
+        </div>
       </div>
     </header>
   );
@@ -1548,6 +1887,42 @@ export default function App() {
   const deletePosition = (id) =>
     setPortfolio((arr) => arr.filter((x) => x.id !== id));
   const addPosition = (pos) => setPortfolio((arr) => [pos, ...arr]);
+  const addPositions = (positions) => setPortfolio((arr) => [...positions, ...arr]);
+
+  // Live-Kurs Refresh
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastRefresh, setLastRefresh] = useState(null);
+
+  const refreshAllQuotes = async (force = false) => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      const updated = await Promise.all(
+        portfolio.map(async (p) => {
+          if (force) quoteCache.delete(normalizeTicker(p.ticker));
+          const m = await getMarketData(p.ticker, settings.finnhubKey).catch(() => null);
+          if (!m || m.price == null) return p;
+          return { ...p, currentPrice: m.price, lastQuoteAt: Date.now(), quoteSource: m.source };
+        })
+      );
+      setPortfolio(updated);
+      setLastRefresh(Date.now());
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  // Auto-Refresh alle 5 Min wenn Tab sichtbar
+  useEffect(() => {
+    if (!hydrated) return;
+    refreshAllQuotes(); // initial
+    const id = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      refreshAllQuotes();
+    }, 5 * 60 * 1000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line
+  }, [hydrated, settings.finnhubKey]);
 
   // Trade handlers
   const addTrade = (t) => setTrades((arr) => [t, ...arr]);
@@ -1614,7 +1989,13 @@ export default function App() {
   return (
     <div className="min-h-screen bg-black text-white font-sans antialiased">
       <div className="max-w-md mx-auto relative">
-        <TopBar title={titleMap[tab]} onSettings={() => setShowSettings(true)} />
+        <TopBar
+          title={titleMap[tab]}
+          onSettings={() => setShowSettings(true)}
+          onRefresh={refreshAllQuotes}
+          refreshing={refreshing}
+          lastRefresh={lastRefresh}
+        />
 
         {tab === 'dashboard' && (
           <Dashboard portfolio={portfolio} fx={fx} onAssess={triggerAssessment} />
@@ -1676,7 +2057,9 @@ export default function App() {
         <AddPositionModal
           open={showAddPosition}
           onClose={() => setShowAddPosition(false)}
-          onAdd={addPosition}
+          onAddMany={addPositions}
+          apiKey={settings.apiKey}
+          finnhubKey={settings.finnhubKey}
         />
 
         <SettingsModal
