@@ -3,11 +3,11 @@ import {
   PieChart, Pie, Cell, ResponsiveContainer, Tooltip,
 } from 'recharts';
 import {
-  Home, Briefcase, ArrowLeftRight, Eye, MessageCircle, Plus, X, Trash2,
-  Settings as SettingsIcon, TrendingUp, TrendingDown, Send, RotateCcw,
-  Sparkles, AlertTriangle, ChevronRight, ArrowLeft, Loader2, Check,
-  Filter, ArrowUpDown, ShieldAlert, Info, Pencil, Flame, Microscope,
-  RefreshCw, Cloud, CloudUpload, CloudDownload, Copy, Pin, Brain,
+  Home, Briefcase, Eye, MessageCircle, Plus, X, Trash2,
+  Settings as SettingsIcon, Send, RotateCcw,
+  Sparkles, AlertTriangle, ChevronRight, Loader2, Check,
+  Info, Pencil, Microscope,
+  Cloud, CloudUpload, CloudDownload, Copy,
 } from 'lucide-react';
 
 /* =========================================================
@@ -679,30 +679,6 @@ Regeln:
     .filter((x) => !skip.has(x.ticker));
 }
 
-const TRENDING_CACHE_KEY = 'trendingApewisdomCache';
-const TRENDING_TTL_MS = 60 * 60 * 1000;
-
-async function fetchTrendingApewisdom({ force = false } = {}) {
-  const cached = await storage.get(TRENDING_CACHE_KEY);
-  if (!force && cached && Date.now() - cached.ts < TRENDING_TTL_MS) {
-    return cached.data;
-  }
-  const url = 'https://apewisdom.io/api/v1.0/filter/wallstreetbets/page/1';
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`apewisdom ${r.status}`);
-  const d = await r.json();
-  const top = (d?.results || []).slice(0, 5).map((x) => ({
-    ticker: String(x.ticker || '').toUpperCase(),
-    name: x.name || x.ticker,
-    mentions: Number(x.mentions) || 0,
-    mentions24h: Number(x.mentions_24h_ago) || 0,
-    rank: Number(x.rank) || null,
-    rankPrev: Number(x.rank_24h_ago) || null,
-  }));
-  await storage.set(TRENDING_CACHE_KEY, { ts: Date.now(), data: top });
-  return top;
-}
-
 /* =========================================================
    Google Apps Script Sync
    ========================================================= */
@@ -961,7 +937,7 @@ function VerdictsCard({ portfolio, onOpenByVerdict }) {
   );
 }
 
-function Dashboard({ portfolio, fx, onAssess, onOpenPosition, onOpenPortfolioByVerdict, insights, onOpenInsights }) {
+function Dashboard({ portfolio, fx, onAssess, onOpenPortfolioByVerdict }) {
   const computed = useMemo(
     () => portfolio.map((p) => computePosition(p, fx)),
     [portfolio, fx]
@@ -983,10 +959,6 @@ function Dashboard({ portfolio, fx, onAssess, onOpenPosition, onOpenPortfolioByV
     computed.forEach((p) => m.set(p.currency, (m.get(p.currency) || 0) + p.mvCHF));
     return Array.from(m.entries()).map(([name, value]) => ({ name, value }));
   }, [computed]);
-
-  const sortedByPct = [...computed].sort((a, b) => b.plPct - a.plPct);
-  const winners = sortedByPct.slice(0, 3);
-  const losers = sortedByPct.slice(-3).reverse();
 
   const renderDonut = (data) => (
     <div className="w-full h-44">
@@ -1064,8 +1036,6 @@ function Dashboard({ portfolio, fx, onAssess, onOpenPosition, onOpenPortfolioByV
 
       <VerdictsCard portfolio={portfolio} onOpenByVerdict={onOpenPortfolioByVerdict} />
 
-      <InsightsCard insights={insights || []} onOpen={() => onOpenInsights?.()} />
-
       <Card className="p-5">
         <h3 className="text-white font-semibold mb-2">Asset-Klassen</h3>
         {renderDonut(byClass)}
@@ -1076,56 +1046,6 @@ function Dashboard({ portfolio, fx, onAssess, onOpenPosition, onOpenPortfolioByV
         <h3 className="text-white font-semibold mb-2">Währungen</h3>
         {renderDonut(byCurrency)}
         {renderLegend(byCurrency)}
-      </Card>
-
-      <Card className="p-5">
-        <h3 className="text-white font-semibold mb-3 flex items-center gap-2">
-          <TrendingUp className="w-4 h-4 text-green-400" />
-          Top-3 Gewinner
-        </h3>
-        <div className="space-y-1">
-          {winners.map((p) => (
-            <button
-              key={p.id}
-              onClick={() => onOpenPosition?.(p.id)}
-              className="w-full flex items-center justify-between gap-2 py-1.5 px-1 rounded-lg hover:bg-neutral-800/60 active:bg-neutral-800 transition text-left"
-            >
-              <div className="min-w-0">
-                <p className="text-white text-sm truncate">{p.name}</p>
-                <p className="text-neutral-500 text-xs">{p.ticker}</p>
-              </div>
-              <div className="flex items-center gap-1.5 shrink-0">
-                <PerfText value={p.plPct} />
-                <ChevronRight className="w-4 h-4 text-neutral-600" />
-              </div>
-            </button>
-          ))}
-        </div>
-      </Card>
-
-      <Card className="p-5">
-        <h3 className="text-white font-semibold mb-3 flex items-center gap-2">
-          <TrendingDown className="w-4 h-4 text-red-400" />
-          Top-3 Verlierer
-        </h3>
-        <div className="space-y-1">
-          {losers.map((p) => (
-            <button
-              key={p.id}
-              onClick={() => onOpenPosition?.(p.id)}
-              className="w-full flex items-center justify-between gap-2 py-1.5 px-1 rounded-lg hover:bg-neutral-800/60 active:bg-neutral-800 transition text-left"
-            >
-              <div className="min-w-0">
-                <p className="text-white text-sm truncate">{p.name}</p>
-                <p className="text-neutral-500 text-xs">{p.ticker}</p>
-              </div>
-              <div className="flex items-center gap-1.5 shrink-0">
-                <PerfText value={p.plPct} />
-                <ChevronRight className="w-4 h-4 text-neutral-600" />
-              </div>
-            </button>
-          ))}
-        </div>
       </Card>
     </div>
   );
@@ -1501,14 +1421,6 @@ function DueDiligenceEditor({ position, onUpdate, apiKey }) {
         rows={2}
       />
 
-      <BulletEditor
-        label="Tags"
-        items={dd.tags}
-        onChange={(v) => setField('tags', v)}
-        accent="blue"
-        placeholder="+ Tag (z.B. defensiv, dividend, AI-Welle)"
-      />
-
       {(dd.history || []).length > 0 && (
         <button
           onClick={() => setHistoryOpen((x) => !x)}
@@ -1735,17 +1647,17 @@ function DDDiffModal({ diff, current, proposed, onClose, onApply }) {
    Position-Detail-Modal
    ========================================================= */
 
-function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onLogTrade, apiKey, onUpdateWithCascade, onAskCoach, insights, onDeleteInsight }) {
-  const [stopLoss, setStopLoss] = useState(position.stopLoss ?? '');
-  const [sellOpen, setSellOpen] = useState(false);
-  const [sellShares, setSellShares] = useState('');
-  const [sellPrice, setSellPrice] = useState(String(position.currentPrice ?? ''));
-  const [sellDate, setSellDate] = useState(new Date().toISOString().slice(0, 10));
-  const [sellFee, setSellFee] = useState('');
-  const [sellLogTrade, setSellLogTrade] = useState(false);
-  const [sellError, setSellError] = useState('');
+function PositionDetail({ position, fx, onClose, onUpdate, onDelete, apiKey, onUpdateWithCascade }) {
+  const p = computePosition(position, fx);
 
-  // Stammdaten-Edit (collapsed by default)
+  // Anteile anpassen (collapsed)
+  const [adjustOpen, setAdjustOpen] = useState(false);
+  const [adjustMode, setAdjustMode] = useState('add'); // 'add' | 'sell'
+  const [adjShares, setAdjShares] = useState('');
+  const [adjPrice, setAdjPrice] = useState(String(position.currentPrice ?? ''));
+  const [adjError, setAdjError] = useState('');
+
+  // Stammdaten-Edit (collapsed)
   const [editOpen, setEditOpen] = useState(false);
   const [edit, setEdit] = useState({
     ticker: position.ticker,
@@ -1757,25 +1669,6 @@ function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onL
     costBasis: String(position.costBasis),
   });
   const [editError, setEditError] = useState('');
-
-  // Nachkauf
-  const [addOpen, setAddOpen] = useState(false);
-  const [addShares, setAddShares] = useState('');
-  const [addPrice, setAddPrice] = useState('');
-  const [addDate, setAddDate] = useState(new Date().toISOString().slice(0, 10));
-  const [addFee, setAddFee] = useState('');
-  const [addLogTrade, setAddLogTrade] = useState(false);
-  const [addError, setAddError] = useState('');
-
-  const p = computePosition(position, fx);
-  const positionTrades = trades.filter((t) => t.ticker === position.ticker);
-
-  const saveStopLoss = () => {
-    onUpdate({
-      ...position,
-      stopLoss: stopLoss === '' || stopLoss == null ? null : parseFloat(stopLoss),
-    });
-  };
 
   const saveEdit = () => {
     setEditError('');
@@ -1803,7 +1696,6 @@ function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onL
       purchaseDate: edit.purchaseDate,
       shares: newShares,
       costBasis: newCost,
-      // Bei Ticker- oder Currency-Wechsel die Resolution neu fahren
       resolvedTicker: tickerChanged || currencyChanged ? null : position.resolvedTicker,
     };
     if (tickerChanged || currencyChanged) {
@@ -1817,102 +1709,144 @@ function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onL
     setEditOpen(false);
   };
 
-  const submitAddPosition = () => {
-    setAddError('');
-    const sh = parseFloat(addShares);
-    const pr = parseFloat(addPrice);
-    if (!Number.isFinite(sh) || sh <= 0) return setAddError('Anzahl ungültig.');
-    if (!Number.isFinite(pr) || pr <= 0) return setAddError('Kurs ungültig.');
-    const newShares = position.shares + sh;
-    const totalCost = position.shares * position.costBasis + sh * pr;
-    const newCost = totalCost / newShares;
-    const updated = { ...position, shares: newShares, costBasis: newCost };
-    const ddNow = ensureDD(updated);
-    updated.dueDiligence = appendDDHistory(ddNow, {
-      ts: Date.now(),
-      source: 'manual',
-      summary: `+${sh} ${position.ticker} @ ${pr} ${position.currency}`,
-      model: '',
-    });
-    onUpdate(updated);
-    if (addLogTrade) {
-      onLogTrade({
-        id: uid(),
-        date: addDate,
-        side: 'buy',
-        ticker: position.ticker,
-        name: position.name,
-        shares: sh,
-        price: pr,
-        currency: position.currency,
-        fee: parseFloat(addFee) || 0,
-        note: 'Nachkauf',
+  const switchAdjustMode = (mode) => {
+    setAdjustMode(mode);
+    setAdjError('');
+    setAdjShares('');
+    setAdjPrice(String(position.currentPrice ?? ''));
+  };
+
+  const submitAdjust = () => {
+    setAdjError('');
+    const sh = parseFloat(adjShares);
+    const pr = parseFloat(adjPrice);
+    if (!Number.isFinite(sh) || sh <= 0) return setAdjError('Anzahl ungültig.');
+    if (!Number.isFinite(pr) || pr <= 0) return setAdjError('Kurs ungültig.');
+
+    if (adjustMode === 'add') {
+      const newShares = position.shares + sh;
+      const newCost = (position.shares * position.costBasis + sh * pr) / newShares;
+      const updated = { ...position, shares: newShares, costBasis: newCost };
+      updated.dueDiligence = appendDDHistory(ensureDD(updated), {
+        ts: Date.now(),
+        source: 'manual',
+        summary: `+${sh} @ ${pr} ${position.currency} → ${newShares.toFixed(2)} Stk, Einstand ${newCost.toFixed(2)}`,
+        model: '',
       });
-    }
-    setAddShares(''); setAddPrice(''); setAddFee('');
-    setAddOpen(false);
-  };
-
-  const askCoachSell = () => {
-    if (!onAskCoach) return;
-    const prompt = `Soll ich meine Position in ${position.name} (${position.ticker}) verkaufen? Ich halte ${position.shares} Stück, Einstand ${position.costBasis} ${position.currency}, aktueller Kurs ${position.currentPrice} ${position.currency} (${p.plPct.toFixed(1)}% P/L). Bitte berücksichtige aktuelle Bewertung, Risiken, Catalysts und mache eine klare Empfehlung (halten / teilverkauf / komplett verkaufen).`;
-    onAskCoach(prompt);
-    onClose();
-  };
-
-  const submitSell = () => {
-    setSellError('');
-    const sh = parseFloat(sellShares);
-    const pr = parseFloat(sellPrice);
-    if (!Number.isFinite(sh) || sh <= 0) return setSellError('Anzahl ungültig.');
-    if (!Number.isFinite(pr) || pr <= 0) return setSellError('Kurs ungültig.');
-    if (sh > position.shares + 1e-9) return setSellError(`Maximal ${position.shares} Stück.`);
-
-    const isFull = sh >= position.shares - 1e-9;
-    if (isFull && !confirm(`Position ${position.name} komplett auflösen?`)) return;
-
-    if (sellLogTrade) {
-      onLogTrade({
-        id: uid(),
-        date: sellDate,
-        side: 'sell',
-        ticker: position.ticker,
-        name: position.name,
-        shares: sh,
-        price: pr,
-        currency: position.currency,
-        fee: parseFloat(sellFee) || 0,
-        note: 'Verkauf',
+      onUpdate(updated);
+    } else {
+      if (sh > position.shares + 1e-9) return setAdjError(`Maximal ${position.shares} Stück.`);
+      const isFull = sh >= position.shares - 1e-9;
+      if (isFull) {
+        if (!confirm(`Position ${position.name} komplett auflösen?`)) return;
+        onDelete(position.id);
+        onClose();
+        return;
+      }
+      const remaining = position.shares - sh;
+      const updated = { ...position, shares: remaining };
+      updated.dueDiligence = appendDDHistory(ensureDD(updated), {
+        ts: Date.now(),
+        source: 'manual',
+        summary: `-${sh} @ ${pr} ${position.currency} → ${remaining.toFixed(2)} Stk`,
+        model: '',
       });
+      onUpdate(updated);
     }
-
-    if (isFull) {
-      onDelete(position.id);
-      onClose();
-      return;
-    }
-
-    const remaining = position.shares - sh;
-    const updated = { ...position, shares: remaining };
-    const ddNow = ensureDD(updated);
-    updated.dueDiligence = appendDDHistory(ddNow, {
-      ts: Date.now(),
-      source: 'manual',
-      summary: `-${sh} ${position.ticker} @ ${pr} ${position.currency}`,
-      model: '',
-    });
-    onUpdate(updated);
-    setSellShares(''); setSellFee('');
-    setSellOpen(false);
+    setAdjShares('');
+    setAdjustOpen(false);
   };
 
-  const positionInsights = (insights || []).filter((i) =>
-    i.scope?.kind === 'position' && i.scope?.ticker === position.ticker
-  );
+  const adjPreview = (() => {
+    const sh = parseFloat(adjShares);
+    const pr = parseFloat(adjPrice);
+    if (!Number.isFinite(sh) || sh <= 0 || !Number.isFinite(pr) || pr <= 0) return null;
+    if (adjustMode === 'add') {
+      const newShares = position.shares + sh;
+      const newCost = (position.shares * position.costBasis + sh * pr) / newShares;
+      return `Neu: ${newShares.toFixed(2)} Stk · Einstand ${newCost.toFixed(2)} ${position.currency}`;
+    }
+    const remaining = Math.max(0, position.shares - sh);
+    const realized = (pr - position.costBasis) * sh;
+    return `Verbleibend: ${remaining.toFixed(2)} Stk · realisiert ${realized >= 0 ? '+' : ''}${fmtCcy(realized, position.currency)}${sh >= position.shares - 1e-9 ? ' · Position wird gelöscht' : ''}`;
+  })();
+
+  const quoteStatus = (position.resolvedTicker && position.resolvedTicker !== position.ticker) || position.quoteSource || position.lastQuoteAt
+    ? [
+        position.resolvedTicker && position.resolvedTicker !== position.ticker ? position.resolvedTicker : null,
+        position.quoteSource ? position.quoteSource : null,
+        position.lastQuoteAt ? `vor ${Math.max(0, Math.round((Date.now() - position.lastQuoteAt) / 60000))} min` : null,
+      ].filter(Boolean).join(' · ')
+    : null;
 
   return (
     <Modal open={true} onClose={onClose} title={position.name}>
       <div className="space-y-4">
+        <Card className="p-4">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-neutral-500 text-xs">{position.ticker} · {position.assetClass} · {position.currency}</p>
+              <p className="text-2xl font-bold text-white tabular-nums mt-1">{fmtCHF(p.mvCHF)}</p>
+              <div className="flex items-baseline gap-2 mt-0.5">
+                <PerfText value={p.plPct} />
+                <span className="text-neutral-500 text-xs">{position.shares} × {fmtCcy(position.currentPrice, position.currency)} · Einstand {fmtCcy(position.costBasis, position.currency)}</span>
+              </div>
+              {quoteStatus && <p className="mt-2 text-[10px] text-neutral-500">{quoteStatus}</p>}
+            </div>
+          </div>
+        </Card>
+
+        <DueDiligenceEditor position={position} onUpdate={onUpdate} apiKey={apiKey} />
+
+        <Card className="p-4">
+          <div className="flex items-center justify-between mb-2">
+            <h4 className="text-white font-semibold text-sm">Anteile anpassen</h4>
+            <button
+              onClick={() => setAdjustOpen((x) => !x)}
+              className="flex items-center gap-1 text-xs text-orange-400 hover:text-orange-300"
+            >
+              <Plus className="w-3.5 h-3.5" /> {adjustOpen ? 'Schliessen' : 'Öffnen'}
+            </button>
+          </div>
+          {!adjustOpen ? (
+            <p className="text-neutral-500 text-xs">Aufstocken (Cost-Basis wird gemittelt) oder reduzieren / komplett auflösen.</p>
+          ) : (
+            <div>
+              <div className="flex gap-2 mb-3">
+                {[
+                  { v: 'add', l: 'Aufstocken' },
+                  { v: 'sell', l: 'Reduzieren' },
+                ].map((b) => (
+                  <button
+                    key={b.v}
+                    onClick={() => switchAdjustMode(b.v)}
+                    className={`flex-1 px-3 py-2 rounded-lg text-xs font-medium transition ${
+                      adjustMode === b.v
+                        ? 'bg-orange-500 text-black'
+                        : 'bg-neutral-800 text-neutral-300'
+                    }`}
+                  >
+                    {b.l}
+                  </button>
+                ))}
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <TextField label="Anzahl" type="number" step="0.0001" value={adjShares} onChange={setAdjShares} />
+                <TextField label={`Kurs (${position.currency})`} type="number" step="0.01" value={adjPrice} onChange={setAdjPrice} />
+              </div>
+              {adjPreview && <p className="text-[11px] text-neutral-400 mb-2">{adjPreview}</p>}
+              {adjError && (
+                <div className="mb-2 text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
+                  <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {adjError}
+                </div>
+              )}
+              <PrimaryBtn onClick={submitAdjust} disabled={!adjShares || !adjPrice}>
+                {adjustMode === 'add' ? 'Aufstocken' : 'Reduzieren'}
+              </PrimaryBtn>
+            </div>
+          )}
+        </Card>
+
         <Card className="p-4">
           <div className="flex items-center justify-between mb-2">
             <h4 className="text-white font-semibold text-sm">Stammdaten</h4>
@@ -1924,51 +1858,7 @@ function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onL
             </button>
           </div>
           {!editOpen ? (
-            <div>
-              <div className="grid grid-cols-2 gap-3 text-sm">
-                <div>
-                  <p className="text-neutral-500 text-xs">Ticker</p>
-                  <p className="text-white">{position.ticker}</p>
-                </div>
-                <div>
-                  <p className="text-neutral-500 text-xs">Asset-Klasse</p>
-                  <p className="text-white">{position.assetClass}</p>
-                </div>
-                <div>
-                  <p className="text-neutral-500 text-xs">Anzahl</p>
-                  <p className="text-white">{position.shares}</p>
-                </div>
-                <div>
-                  <p className="text-neutral-500 text-xs">Währung</p>
-                  <p className="text-white">{position.currency}</p>
-                </div>
-                <div>
-                  <p className="text-neutral-500 text-xs">Einstand</p>
-                  <p className="text-white">{fmtCcy(position.costBasis, position.currency)}</p>
-                </div>
-                <div>
-                  <p className="text-neutral-500 text-xs">Aktueller Kurs</p>
-                  <p className="text-white">{fmtCcy(position.currentPrice, position.currency)}</p>
-                </div>
-                <div>
-                  <p className="text-neutral-500 text-xs">Marktwert</p>
-                  <p className="text-white">{fmtCHF(p.mvCHF)}</p>
-                </div>
-                <div>
-                  <p className="text-neutral-500 text-xs">P/L</p>
-                  <PerfText value={p.plPct} />
-                </div>
-              </div>
-              {(position.resolvedTicker || position.quoteSource || position.lastQuoteAt) && (
-                <p className="mt-3 text-[10px] text-neutral-500">
-                  {[
-                    position.resolvedTicker && position.resolvedTicker !== position.ticker ? position.resolvedTicker : null,
-                    position.quoteSource ? position.quoteSource : null,
-                    position.lastQuoteAt ? `vor ${Math.max(0, Math.round((Date.now() - position.lastQuoteAt) / 60000))} min` : null,
-                  ].filter(Boolean).join(' · ')}
-                </p>
-              )}
-            </div>
+            <p className="text-neutral-500 text-xs">{position.ticker} · {position.assetClass} · {position.currency} · {position.purchaseDate || '—'}</p>
           ) : (
             <div>
               <div className="grid grid-cols-2 gap-3">
@@ -1985,7 +1875,7 @@ function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onL
                 <TextField label={`Einstand (${edit.currency})`} type="number" step="0.01" value={edit.costBasis} onChange={(v) => setEdit({ ...edit, costBasis: v })} />
               </div>
               {edit.ticker.trim().toUpperCase() !== position.ticker && (
-                <p className="text-[11px] text-orange-300 mb-2">Ticker ändert sich → bestehende Trades werden mitgeführt, Kurs wird beim nächsten Refresh neu geholt.</p>
+                <p className="text-[11px] text-orange-300 mb-2">Ticker ändert sich → Kurs wird beim nächsten Refresh neu geholt.</p>
               )}
               {edit.currency !== position.currency && (
                 <p className="text-[11px] text-orange-300 mb-2">Währung ändert sich → Kurs in neuer Währung wird beim nächsten Refresh geholt.</p>
@@ -1999,185 +1889,6 @@ function PositionDetail({ position, trades, fx, onClose, onUpdate, onDelete, onL
             </div>
           )}
         </Card>
-
-        <Card className="p-4">
-          <div className="flex items-center justify-between mb-2">
-            <h4 className="text-white font-semibold text-sm">Nachkauf</h4>
-            <button
-              onClick={() => setAddOpen((x) => !x)}
-              className="flex items-center gap-1 text-xs text-orange-400 hover:text-orange-300"
-            >
-              <Plus className="w-3.5 h-3.5" /> {addOpen ? 'Schliessen' : 'Hinzufügen'}
-            </button>
-          </div>
-          {!addOpen ? (
-            <p className="text-neutral-500 text-xs">Position aufstocken → Anzahl und Cost-Basis werden anteilig neu berechnet.</p>
-          ) : (
-            <div>
-              <div className="grid grid-cols-2 gap-3">
-                <TextField label="Anzahl" type="number" step="0.0001" value={addShares} onChange={setAddShares} />
-                <TextField label={`Kurs (${position.currency})`} type="number" step="0.01" value={addPrice} onChange={setAddPrice} />
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <TextField label="Datum" type="date" value={addDate} onChange={setAddDate} />
-                <TextField label="Gebühren" type="number" step="0.01" value={addFee} onChange={setAddFee} />
-              </div>
-              <label className="flex items-center gap-2 text-xs text-neutral-400 mb-3 select-none">
-                <input
-                  type="checkbox"
-                  checked={addLogTrade}
-                  onChange={(e) => setAddLogTrade(e.target.checked)}
-                  className="accent-orange-500"
-                />
-                Auch als Trade loggen (optional)
-              </label>
-              {addShares && addPrice && (
-                <p className="text-[11px] text-neutral-400 mb-2">
-                  Neue Position: {(position.shares + parseFloat(addShares || 0)).toFixed(2)} Stück, Cost-Basis {(((position.shares * position.costBasis) + (parseFloat(addShares || 0) * parseFloat(addPrice || 0))) / (position.shares + parseFloat(addShares || 0))).toFixed(2)} {position.currency}
-                </p>
-              )}
-              {addError && (
-                <div className="mb-2 text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
-                  <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {addError}
-                </div>
-              )}
-              <PrimaryBtn onClick={submitAddPosition} disabled={!addShares || !addPrice}>Nachkauf eintragen</PrimaryBtn>
-            </div>
-          )}
-        </Card>
-
-        <Card className="p-4">
-          <h4 className="text-white font-semibold mb-2">Kurs & Stop-Loss</h4>
-          <div className="grid grid-cols-2 gap-3">
-            <TextField
-              label="Aktueller Kurs (Override)"
-              type="number"
-              step="0.01"
-              value={position.currentPrice}
-              onChange={(v) => onUpdate({ ...position, currentPrice: parseFloat(v) || 0 })}
-            />
-            <TextField
-              label={`Stop-Loss (${position.currency})`}
-              type="number"
-              step="0.01"
-              value={stopLoss}
-              onChange={setStopLoss}
-              placeholder="z.B. 18.50"
-            />
-          </div>
-          <PrimaryBtn onClick={saveStopLoss}>Stop-Loss speichern</PrimaryBtn>
-        </Card>
-
-        <DueDiligenceEditor position={position} onUpdate={onUpdate} apiKey={apiKey} />
-
-        <Card className="p-4">
-          <div className="flex items-center justify-between mb-2">
-            <h4 className="text-white font-semibold text-sm">Verkauf</h4>
-            <button
-              onClick={() => setSellOpen((x) => !x)}
-              className="flex items-center gap-1 text-xs text-orange-400 hover:text-orange-300"
-            >
-              <Trash2 className="w-3.5 h-3.5" /> {sellOpen ? 'Schliessen' : 'Hinzufügen'}
-            </button>
-          </div>
-          <button
-            onClick={askCoachSell}
-            disabled={!onAskCoach}
-            className="w-full flex items-center justify-center gap-1.5 bg-orange-500/15 hover:bg-orange-500/25 disabled:opacity-40 text-orange-300 px-3 py-2 rounded-lg text-xs font-medium transition mb-2"
-          >
-            <MessageCircle className="w-3.5 h-3.5" /> Coach: soll ich verkaufen?
-          </button>
-          {!sellOpen ? (
-            <p className="text-neutral-500 text-xs">Teilverkauf oder komplett auflösen – Cost-Basis bleibt unverändert (Avg-Cost).</p>
-          ) : (
-            <div>
-              <div className="grid grid-cols-2 gap-3">
-                <TextField label="Anzahl" type="number" step="0.0001" value={sellShares} onChange={setSellShares} />
-                <TextField label={`Kurs (${position.currency})`} type="number" step="0.01" value={sellPrice} onChange={setSellPrice} />
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <TextField label="Datum" type="date" value={sellDate} onChange={setSellDate} />
-                <TextField label="Gebühren" type="number" step="0.01" value={sellFee} onChange={setSellFee} />
-              </div>
-              <label className="flex items-center gap-2 text-xs text-neutral-400 mb-3 select-none">
-                <input
-                  type="checkbox"
-                  checked={sellLogTrade}
-                  onChange={(e) => setSellLogTrade(e.target.checked)}
-                  className="accent-orange-500"
-                />
-                Auch als Trade loggen (optional)
-              </label>
-              {sellShares && sellPrice && parseFloat(sellShares) > 0 && (
-                (() => {
-                  const sh = parseFloat(sellShares);
-                  const pr = parseFloat(sellPrice);
-                  const remaining = Math.max(0, position.shares - sh);
-                  const realized = (pr - position.costBasis) * sh;
-                  return (
-                    <p className="text-[11px] text-neutral-400 mb-2">
-                      Verbleibend: {remaining.toFixed(2)} Stück (von {position.shares}) · realisiert {realized >= 0 ? '+' : ''}{fmtCcy(realized, position.currency)}
-                      {sh >= position.shares - 1e-9 && ' · Position wird gelöscht'}
-                    </p>
-                  );
-                })()
-              )}
-              {sellError && (
-                <div className="mb-2 text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
-                  <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {sellError}
-                </div>
-              )}
-              <PrimaryBtn onClick={submitSell} disabled={!sellShares || !sellPrice}>Verkauf eintragen</PrimaryBtn>
-            </div>
-          )}
-        </Card>
-
-        {positionInsights.length > 0 && (
-          <Card className="p-4">
-            <h4 className="text-white font-semibold mb-2 text-sm flex items-center gap-1.5">
-              <Sparkles className="w-4 h-4 text-orange-400" /> Erkenntnisse ({positionInsights.length})
-            </h4>
-            <div className="space-y-2">
-              {positionInsights.map((ins) => (
-                <div key={ins.id} className="text-xs bg-neutral-900/60 border border-neutral-800 rounded-lg p-2">
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-neutral-500">{new Date(ins.ts).toLocaleString('de-CH', { dateStyle: 'short', timeStyle: 'short' })}</span>
-                    <button onClick={() => onDeleteInsight?.(ins.id)} className="text-neutral-600 hover:text-red-400">
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                  <p className="text-neutral-300 whitespace-pre-wrap">{ins.text}</p>
-                  {ins.tags?.length > 0 && (
-                    <div className="flex gap-1 mt-1.5 flex-wrap">
-                      {ins.tags.map((t, i) => <Pill key={i} color="blue">{t}</Pill>)}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          </Card>
-        )}
-
-        {positionTrades.length > 0 && (
-          <Card className="p-4">
-            <h4 className="text-white font-semibold mb-2">Trade-Historie</h4>
-            <div className="space-y-2">
-              {positionTrades.map((t) => (
-                <div key={t.id} className="flex items-center justify-between text-sm">
-                  <div>
-                    <Pill color={t.side === 'buy' ? 'green' : 'red'}>
-                      {t.side === 'buy' ? 'BUY' : 'SELL'}
-                    </Pill>
-                    <span className="text-neutral-400 ml-2">{t.date}</span>
-                  </div>
-                  <div className="text-right">
-                    <p className="text-white tabular-nums">{t.shares} × {fmtCcy(t.price, t.currency)}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </Card>
-        )}
 
         <button
           onClick={() => {
@@ -2357,206 +2068,16 @@ function AddPositionModal({ open, onClose, onAddMany, apiKey, finnhubKey }) {
 }
 
 /* =========================================================
-   Trades Tab
-   ========================================================= */
-
-function TradesTab({ trades, portfolio, fx, onAddTrade, onDeleteTrade }) {
-  const [filterTicker, setFilterTicker] = useState('');
-  const [filterSide, setFilterSide] = useState('all');
-  const [filterFrom, setFilterFrom] = useState('');
-  const [filterTo, setFilterTo] = useState('');
-  const [showAdd, setShowAdd] = useState(false);
-
-  const filtered = useMemo(() => {
-    return trades
-      .filter((t) => !filterTicker || t.ticker.toLowerCase().includes(filterTicker.toLowerCase()))
-      .filter((t) => filterSide === 'all' || t.side === filterSide)
-      .filter((t) => !filterFrom || t.date >= filterFrom)
-      .filter((t) => !filterTo || t.date <= filterTo)
-      .sort((a, b) => b.date.localeCompare(a.date));
-  }, [trades, filterTicker, filterSide, filterFrom, filterTo]);
-
-  // YTD realisierte P/L: für jeden Sell-Trade dieses Jahres, schätze Einstand
-  const ytdRealized = useMemo(() => {
-    const year = new Date().getFullYear().toString();
-    const sells = trades.filter((t) => t.side === 'sell' && t.date.startsWith(year));
-    let totalCHF = 0;
-    for (const s of sells) {
-      const pos = portfolio.find((p) => p.ticker === s.ticker);
-      const cost = pos ? pos.costBasis : s.price;
-      const plLocal = (s.price - cost) * s.shares - (s.fee || 0);
-      totalCHF += toCHF(plLocal, s.currency, fx);
-    }
-    return totalCHF;
-  }, [trades, portfolio, fx]);
-
-  return (
-    <div className="px-4 pb-28 pt-4 space-y-3">
-      <Card className="p-4">
-        <p className="text-neutral-400 text-xs">Realisiert YTD ({new Date().getFullYear()})</p>
-        <p className={`text-2xl font-bold mt-1 ${ytdRealized >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-          {ytdRealized >= 0 ? '+' : ''}
-          {fmtCHF(ytdRealized)}
-        </p>
-        <p className="text-neutral-500 text-xs mt-1 flex items-center gap-1">
-          <Info className="w-3 h-3" /> Schweiz: privat keine Kapitalgewinnsteuer
-        </p>
-      </Card>
-
-      <Card className="p-4 space-y-2">
-        <div className="flex items-center gap-2 text-neutral-400 text-xs">
-          <Filter className="w-3 h-3" /> Filter
-        </div>
-        <div className="grid grid-cols-2 gap-2">
-          <input
-            type="text"
-            value={filterTicker}
-            onChange={(e) => setFilterTicker(e.target.value)}
-            placeholder="Ticker"
-            className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-white"
-          />
-          <select
-            value={filterSide}
-            onChange={(e) => setFilterSide(e.target.value)}
-            className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-white"
-          >
-            <option value="all">Alle</option>
-            <option value="buy">Buy</option>
-            <option value="sell">Sell</option>
-          </select>
-          <input
-            type="date"
-            value={filterFrom}
-            onChange={(e) => setFilterFrom(e.target.value)}
-            className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-white"
-          />
-          <input
-            type="date"
-            value={filterTo}
-            onChange={(e) => setFilterTo(e.target.value)}
-            className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-white"
-          />
-        </div>
-      </Card>
-
-      <button
-        onClick={() => setShowAdd(true)}
-        className="w-full bg-orange-500 text-black font-semibold py-3 rounded-xl flex items-center justify-center gap-2"
-      >
-        <Plus className="w-4 h-4" /> Neuer Trade
-      </button>
-
-      {filtered.map((t) => (
-        <Card key={t.id} className="p-4">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <Pill color={t.side === 'buy' ? 'green' : 'red'}>
-                  {t.side === 'buy' ? 'BUY' : 'SELL'}
-                </Pill>
-                <span className="text-white font-semibold">{t.ticker}</span>
-                <span className="text-neutral-500 text-xs">{t.date}</span>
-              </div>
-              <p className="text-neutral-300 text-sm mt-1">
-                {t.shares} × {fmtCcy(t.price, t.currency)}
-                {t.fee ? ` · Geb. ${fmtCcy(t.fee, t.currency)}` : ''}
-              </p>
-              {t.note && <p className="text-neutral-500 text-xs mt-1 italic">„{t.note}"</p>}
-            </div>
-            <button onClick={() => onDeleteTrade(t.id)}>
-              <Trash2 className="w-4 h-4 text-neutral-500 hover:text-red-400" />
-            </button>
-          </div>
-        </Card>
-      ))}
-
-      {filtered.length === 0 && (
-        <Card className="p-8 text-center">
-          <p className="text-neutral-400">Noch keine Trades.</p>
-        </Card>
-      )}
-
-      <AddTradeModal open={showAdd} onClose={() => setShowAdd(false)} onAdd={onAddTrade} portfolio={portfolio} />
-    </div>
-  );
-}
-
-function AddTradeModal({ open, onClose, onAdd, portfolio }) {
-  const [form, setForm] = useState({
-    date: new Date().toISOString().slice(0, 10),
-    side: 'buy',
-    ticker: '',
-    name: '',
-    shares: '',
-    price: '',
-    currency: 'CHF',
-    fee: '',
-    note: '',
-  });
-  const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
-
-  const submit = () => {
-    if (!form.ticker || !form.shares || !form.price) return;
-    onAdd({
-      id: uid(),
-      date: form.date,
-      side: form.side,
-      ticker: form.ticker.toUpperCase(),
-      name: form.name,
-      shares: parseFloat(form.shares),
-      price: parseFloat(form.price),
-      currency: form.currency,
-      fee: parseFloat(form.fee) || 0,
-      note: form.note,
-    });
-    onClose();
-    setForm({
-      date: new Date().toISOString().slice(0, 10),
-      side: 'buy', ticker: '', name: '', shares: '', price: '', currency: 'CHF', fee: '', note: '',
-    });
-  };
-
-  return (
-    <Modal
-      open={open}
-      onClose={onClose}
-      title="Neuer Trade"
-      footer={<PrimaryBtn onClick={submit}>Hinzufügen</PrimaryBtn>}
-    >
-      <div className="grid grid-cols-2 gap-3">
-        <SelectField label="Seite" value={form.side} onChange={(v) => set('side', v)} options={['buy', 'sell']} />
-        <TextField label="Datum" type="date" value={form.date} onChange={(v) => set('date', v)} />
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        <TextField label="Ticker" value={form.ticker} onChange={(v) => set('ticker', v)} placeholder="NOVN" />
-        <TextField label="Name" value={form.name} onChange={(v) => set('name', v)} />
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        <TextField label="Anzahl" type="number" step="0.01" value={form.shares} onChange={(v) => set('shares', v)} />
-        <TextField label="Preis" type="number" step="0.01" value={form.price} onChange={(v) => set('price', v)} />
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        <SelectField label="Währung" value={form.currency} onChange={(v) => set('currency', v)} options={CURRENCIES} />
-        <TextField label="Gebühren" type="number" step="0.01" value={form.fee} onChange={(v) => set('fee', v)} />
-      </div>
-      <TextArea label="These / Notiz" value={form.note} onChange={(v) => set('note', v)} placeholder="Warum dieser Trade?" />
-    </Modal>
-  );
-}
-
-/* =========================================================
    Watchlist Tab
    ========================================================= */
 
-function WatchlistTab({ watchlist, portfolio, onAdd, onAddMany, onRemove, onUpdate, onConvert, apiKey, onAskCoach }) {
+function WatchlistTab({ watchlist, portfolio, onAdd, onAddMany, onRemove, onUpdate, onConvert, apiKey }) {
   const [showAdd, setShowAdd] = useState(false);
   const [convertItem, setConvertItem] = useState(null);
   const [ddItem, setDdItem] = useState(null);
 
   return (
     <div className="px-4 pb-28 pt-4 space-y-3">
-      <TrendingCard onAddWatchlist={onAdd} watchlist={watchlist} onAskCoach={onAskCoach} />
-
       <WatchlistGeneratorCard
         portfolio={portfolio}
         watchlist={watchlist}
@@ -2650,107 +2171,6 @@ function WatchlistTab({ watchlist, portfolio, onAdd, onAddMany, onRemove, onUpda
         />
       )}
     </div>
-  );
-}
-
-function TrendingCard({ onAddWatchlist, watchlist, onAskCoach }) {
-  const [data, setData] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState('');
-  const [ts, setTs] = useState(null);
-
-  const load = async (force = false) => {
-    setLoading(true);
-    setErr('');
-    try {
-      const d = await fetchTrendingApewisdom({ force });
-      setData(d);
-      const cached = await storage.get(TRENDING_CACHE_KEY);
-      setTs(cached?.ts || Date.now());
-    } catch (e) {
-      setErr('Trending nicht erreichbar');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => { load(false); }, []);
-
-  const ago = ts ? Math.max(0, Math.round((Date.now() - ts) / 60000)) : null;
-  const onWatchlist = new Set(watchlist.map((w) => w.ticker.toUpperCase()));
-
-  return (
-    <Card className="p-4">
-      <div className="flex items-center justify-between mb-2">
-        <h4 className="text-white font-semibold flex items-center gap-1.5 text-sm">
-          <Flame className="w-4 h-4 text-orange-400" /> Trending r/wallstreetbets
-        </h4>
-        <button onClick={() => load(true)} disabled={loading} className="text-neutral-400 hover:text-white disabled:opacity-40">
-          {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-        </button>
-      </div>
-      {err && <p className="text-neutral-500 text-xs italic">{err} – App funktioniert weiter.</p>}
-      {!err && data.length === 0 && !loading && (
-        <p className="text-neutral-500 text-xs">Noch keine Daten.</p>
-      )}
-      <div className="space-y-1.5">
-        {data.map((t) => {
-          const already = onWatchlist.has(t.ticker);
-          const rankDelta = t.rankPrev != null && t.rank != null ? t.rankPrev - t.rank : null;
-          return (
-            <div key={t.ticker} className="flex items-center justify-between gap-2 py-1">
-              <div className="min-w-0 flex-1">
-                <p className="text-white text-sm font-medium truncate">
-                  {t.ticker} <span className="text-neutral-500 font-normal">· {t.name}</span>
-                </p>
-                <p className="text-[11px] text-neutral-500">
-                  {t.mentions} Mentions
-                  {rankDelta != null && rankDelta !== 0 && (
-                    <span className={rankDelta > 0 ? 'text-green-400 ml-1' : 'text-red-400 ml-1'}>
-                      {rankDelta > 0 ? `↑${rankDelta}` : `↓${-rankDelta}`}
-                    </span>
-                  )}
-                </p>
-              </div>
-              <div className="flex gap-1 shrink-0">
-                <button
-                  onClick={() => {
-                    if (already) return;
-                    onAddWatchlist({
-                      id: uid(),
-                      ticker: t.ticker,
-                      name: t.name,
-                      triggerPrice: null,
-                      currency: 'USD',
-                      thesis: 'Trending in r/wallstreetbets',
-                      source: 'ai',
-                      addedAt: new Date().toISOString(),
-                    });
-                  }}
-                  disabled={already}
-                  className="bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 text-white p-1.5 rounded-lg"
-                  title={already ? 'Schon auf Watchlist' : 'Auf Watchlist'}
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  onClick={() => onAskCoach?.(`Was sagst du zu ${t.ticker} (${t.name})? Aktuelle Lage, Bewertung, Risiken. Es ist gerade trending in r/wallstreetbets mit ${t.mentions} Mentions – ist das ein Signal oder Noise?`)}
-                  className="bg-orange-500/20 hover:bg-orange-500/30 text-orange-400 p-1.5 rounded-lg"
-                  title="Coach analysieren"
-                >
-                  <MessageCircle className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-      {ago != null && (
-        <p className="text-[10px] text-neutral-600 mt-2">
-          Aktualisiert {ago === 0 ? 'gerade' : `vor ${ago} Min`} · apewisdom.io
-        </p>
-      )}
-    </Card>
   );
 }
 
@@ -3044,7 +2464,7 @@ function ConvertToPositionModal({ item, onClose, onConfirm }) {
    Coach (AI Chat) Tab
    ========================================================= */
 
-function CoachTab({ portfolio, trades, watchlist, fx, apiKey, chatHistory, setChatHistory, onAddWatchlistFromAI, onApplyDDUpdate, onApplyWatchlistDDUpdate, onPinInsight, assessmentTrigger, onAssessmentDone, pendingQuestion, onPendingQuestionConsumed }) {
+function CoachTab({ portfolio, watchlist, fx, apiKey, chatHistory, setChatHistory, onAddWatchlistFromAI, onApplyDDUpdate, onApplyWatchlistDDUpdate, assessmentTrigger, onAssessmentDone }) {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
@@ -3128,9 +2548,6 @@ FX (in CHF): ${JSON.stringify(fx)}
 Portfolio (Compact-JSON, eine Zeile pro Position):
 ${portfolioSummary.map((x) => JSON.stringify(x)).join('\n')}
 
-Trades-History (letzte 30):
-${JSON.stringify(trades.slice(-30))}
-
 Watchlist (Compact-JSON, eine Zeile pro Item):
 ${watchlistSummary.map((x) => JSON.stringify(x)).join('\n') || '(leer)'}`;
   };
@@ -3176,15 +2593,6 @@ ${watchlistSummary.map((x) => JSON.stringify(x)).join('\n') || '(leer)'}`;
     }
     // eslint-disable-next-line
   }, [assessmentTrigger]);
-
-  // Pending-Question vom App-State (z.B. "soll ich X verkaufen?", "was sagst du zu Y?")
-  useEffect(() => {
-    if (pendingQuestion && pendingQuestion.text) {
-      send(pendingQuestion.text);
-      onPendingQuestionConsumed?.();
-    }
-    // eslint-disable-next-line
-  }, [pendingQuestion?.id]);
 
   const parseSuggestions = (text) => {
     const re = /\[WATCHLIST_VORSCHLAG:\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^\]]+?)\s*\]/g;
@@ -3252,14 +2660,14 @@ ${watchlistSummary.map((x) => JSON.stringify(x)).join('\n') || '(leer)'}`;
         {chatHistory.length === 0 && (
           <Card className="p-4 mt-3">
             <p className="text-neutral-300 text-sm">
-              Ich kenne dein Portfolio, deine Watchlist (inkl. DDs) und Trades. Antworten kannst du via 📌 als Erkenntnis pinnen.
+              Ich kenne dein Portfolio und deine Watchlist inklusive aller DDs. Ich kann DD-Updates vorschlagen (du bestätigst pro Feld).
             </p>
             <div className="mt-3 space-y-2">
               {[
                 'Wo habe ich gerade ein Klumpenrisiko?',
-                'Welche Position sollte ich verkaufen?',
-                'Wie ist mein Exposure gegenüber AI-Infra?',
-                'Update meine Watchlist-DDs mit aktuellen Risiken/Catalysts.',
+                'Welche Positionen haben einen Verkaufs-Verdict?',
+                'Welche DDs sind älter als 90 Tage und brauchen ein Refresh?',
+                'Schlage Risiken-Updates für meine roten Positionen vor.',
               ].map((s) => (
                 <button
                   key={s}
@@ -3346,17 +2754,6 @@ ${watchlistSummary.map((x) => JSON.stringify(x)).join('\n') || '(leer)'}`;
                         Coach möchte tiefere Daten zu <b>{tk}</b>. Öffne die Position und klicke „Tief analysieren".
                       </div>
                     ))}
-                  </div>
-                )}
-                {!isUser && !m.error && cleaned && (
-                  <div className="mt-2 flex justify-end">
-                    <button
-                      onClick={() => onPinInsight?.(cleaned)}
-                      className="text-[11px] text-neutral-400 hover:text-orange-300 flex items-center gap-1 transition"
-                      title="Als Erkenntnis pinnen"
-                    >
-                      <Pin className="w-3 h-3" /> Pinnen
-                    </button>
                   </div>
                 )}
               </div>
@@ -3489,164 +2886,6 @@ function SuggestionCard({ suggestion, onAccept }) {
 }
 
 /* =========================================================
-   Insights (pin-to-knowledge)
-   ========================================================= */
-
-function PinInsightModal({ initialText, portfolio, watchlist, onClose, onSave }) {
-  const [text, setText] = useState((initialText || '').slice(0, 1000));
-  const [scopeKind, setScopeKind] = useState('portfolio');
-  const [scopeTicker, setScopeTicker] = useState('');
-  const [tags, setTags] = useState([]);
-
-  const tickerOptions = useMemo(() => {
-    const fromPortfolio = portfolio.map((p) => ({ ticker: p.ticker, name: p.name, kind: 'position' }));
-    const fromWatchlist = watchlist.map((w) => ({ ticker: w.ticker, name: w.name, kind: 'watchlist' }));
-    const seen = new Set();
-    return [...fromPortfolio, ...fromWatchlist].filter((x) => {
-      if (seen.has(x.ticker)) return false;
-      seen.add(x.ticker); return true;
-    });
-  }, [portfolio, watchlist]);
-
-  const submit = () => {
-    if (!text.trim()) return;
-    const scope = scopeKind === 'portfolio'
-      ? { kind: 'portfolio' }
-      : (() => {
-          const t = tickerOptions.find((x) => x.ticker === scopeTicker);
-          return { kind: t?.kind || 'position', ticker: scopeTicker };
-        })();
-    onSave({
-      id: uid(),
-      ts: Date.now(),
-      text: text.trim().slice(0, 1000),
-      scope,
-      tags,
-    });
-  };
-
-  return (
-    <Modal
-      open={true}
-      onClose={onClose}
-      title="Als Erkenntnis pinnen"
-      footer={<PrimaryBtn onClick={submit} disabled={!text.trim()}>Pinnen</PrimaryBtn>}
-    >
-      <TextArea label="Text" value={text} onChange={(v) => setText(v.slice(0, 1000))} rows={6} />
-      <p className="text-[11px] text-neutral-500 mb-3">{text.length}/1000 Zeichen</p>
-      <SelectField
-        label="Scope"
-        value={scopeKind}
-        onChange={(v) => { setScopeKind(v); if (v === 'portfolio') setScopeTicker(''); }}
-        options={['portfolio', 'ticker']}
-      />
-      {scopeKind === 'ticker' && (
-        <div className="mb-3">
-          <label className="block text-xs font-medium text-neutral-400 mb-1">Ticker</label>
-          <select
-            value={scopeTicker}
-            onChange={(e) => setScopeTicker(e.target.value)}
-            className="w-full bg-neutral-900 border border-neutral-700 rounded-xl px-3 py-2.5 text-white focus:outline-none focus:border-orange-500"
-          >
-            <option value="">— wählen —</option>
-            {tickerOptions.map((t) => (
-              <option key={t.ticker} value={t.ticker}>{t.ticker} · {t.name} ({t.kind === 'position' ? 'Portfolio' : 'Watchlist'})</option>
-            ))}
-          </select>
-        </div>
-      )}
-      <BulletEditor label="Tags" items={tags} onChange={setTags} accent="blue" placeholder="+ Tag (z.B. Klumpenrisiko, Macro)" />
-    </Modal>
-  );
-}
-
-function InsightsCard({ insights, onOpen }) {
-  const recent = (insights || []).slice(0, 3);
-  return (
-    <Card className="p-5">
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="text-white font-semibold flex items-center gap-2">
-          <Brain className="w-4 h-4 text-orange-400" /> Letzte Erkenntnisse
-        </h3>
-        {(insights || []).length > 0 && (
-          <button onClick={onOpen} className="text-xs text-orange-400 hover:text-orange-300">
-            Alle ({insights.length})
-          </button>
-        )}
-      </div>
-      {recent.length === 0 ? (
-        <p className="text-neutral-500 text-xs">Pinne Coach-Antworten via 📌, um sie hier zu sammeln.</p>
-      ) : (
-        <div className="space-y-2">
-          {recent.map((ins) => {
-            const d = new Date(ins.ts);
-            const scopeLabel = ins.scope?.kind === 'portfolio'
-              ? 'Portfolio'
-              : ins.scope?.ticker || (ins.scope?.kind || 'Scope');
-            return (
-              <button key={ins.id} onClick={onOpen} className="w-full text-left bg-neutral-900/60 hover:bg-neutral-900 border border-neutral-800 rounded-lg p-2.5 transition">
-                <div className="flex items-center justify-between mb-1">
-                  <Pill color={ins.scope?.kind === 'portfolio' ? 'accent' : 'blue'}>{scopeLabel}</Pill>
-                  <span className="text-[10px] text-neutral-500">{d.toLocaleDateString('de-CH', { day: '2-digit', month: '2-digit', year: '2-digit' })}</span>
-                </div>
-                <p className="text-neutral-300 text-xs line-clamp-2">{ins.text}</p>
-              </button>
-            );
-          })}
-        </div>
-      )}
-    </Card>
-  );
-}
-
-function InsightsModal({ open, onClose, insights, onDelete }) {
-  const [filterTicker, setFilterTicker] = useState('');
-  const filtered = useMemo(() => {
-    if (!filterTicker) return insights;
-    const f = filterTicker.toUpperCase();
-    return insights.filter((i) =>
-      (i.scope?.kind === 'portfolio' && f === 'PORTFOLIO') ||
-      (i.scope?.ticker && i.scope.ticker.includes(f))
-    );
-  }, [insights, filterTicker]);
-
-  return (
-    <Modal open={open} onClose={onClose} title={`Erkenntnisse (${insights.length})`}>
-      <TextField label="Filter (Ticker oder 'portfolio')" value={filterTicker} onChange={setFilterTicker} placeholder="NOVN, portfolio, …" />
-      {filtered.length === 0 ? (
-        <Card className="p-6 text-center"><p className="text-neutral-400 text-sm">Keine Treffer.</p></Card>
-      ) : (
-        <div className="space-y-2">
-          {filtered.map((ins) => {
-            const d = new Date(ins.ts);
-            const scopeLabel = ins.scope?.kind === 'portfolio' ? 'Portfolio' : (ins.scope?.ticker || 'Scope');
-            return (
-              <Card key={ins.id} className="p-3">
-                <div className="flex items-center justify-between mb-1.5">
-                  <div className="flex items-center gap-1.5">
-                    <Pill color={ins.scope?.kind === 'portfolio' ? 'accent' : 'blue'}>{scopeLabel}</Pill>
-                    <span className="text-[10px] text-neutral-500">{d.toLocaleString('de-CH', { dateStyle: 'short', timeStyle: 'short' })}</span>
-                  </div>
-                  <button onClick={() => onDelete(ins.id)} className="text-neutral-500 hover:text-red-400 p-1">
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-                <p className="text-neutral-200 text-sm whitespace-pre-wrap">{ins.text}</p>
-                {ins.tags?.length > 0 && (
-                  <div className="flex gap-1 mt-2 flex-wrap">
-                    {ins.tags.map((t, i) => <Pill key={i} color="blue">{t}</Pill>)}
-                  </div>
-                )}
-              </Card>
-            );
-          })}
-        </div>
-      )}
-    </Modal>
-  );
-}
-
-/* =========================================================
    Apps-Script-Quelltext (in Sheet → Apps Script einfügen)
    ========================================================= */
 
@@ -3734,7 +2973,7 @@ function pullAll() {
    Settings Modal
    ========================================================= */
 
-function SettingsModal({ open, onClose, settings, setSettings, onReset, portfolio, trades, watchlist, insights, onImport }) {
+function SettingsModal({ open, onClose, settings, setSettings, onReset, portfolio, watchlist, onImport }) {
   const [fx, setFx] = useState(settings.fx);
   const [apiKey, setApiKey] = useState(settings.apiKey || '');
   const [finnhubKey, setFinnhubKey] = useState(settings.finnhubKey || '');
@@ -3759,7 +2998,8 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset, portfoli
     setSyncBusy(true); setSyncErr(''); setSyncStatus('');
     try {
       const url = gasUrl.trim();
-      await gasPush(url, { portfolio, trades, watchlist });
+      // trades:[] für Backwards-Compat mit Apps-Script (Trades-Tab im Sheet bleibt leer)
+      await gasPush(url, { portfolio, trades: [], watchlist });
       setSyncStatus(`Push OK – ${new Date().toLocaleString('de-CH')}`);
       setSettings({ ...settings, gasUrl: url, lastSheetSyncAt: Date.now(), lastSheetSyncKind: 'push' });
     } catch (e) {
@@ -3796,12 +3036,10 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset, portfoli
 
   const exportData = () => {
     const payload = {
-      version: 2,
+      version: 3,
       exportedAt: new Date().toISOString(),
       portfolio,
-      trades,
       watchlist,
-      insights: insights || [],
       settings: { fx: settings.fx }, // KEINE API-Keys exportieren
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
@@ -3823,7 +3061,7 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset, portfoli
       const txt = await file.text();
       const data = JSON.parse(txt);
       if (!data || !Array.isArray(data.portfolio)) throw new Error('Ungültiges Backup-Format (portfolio fehlt).');
-      if (!confirm(`Backup vom ${data.exportedAt?.slice(0,10) || '?'} importieren? Überschreibt Portfolio (${data.portfolio.length}), Trades (${data.trades?.length || 0}) und Watchlist (${data.watchlist?.length || 0}).`)) {
+      if (!confirm(`Backup vom ${data.exportedAt?.slice(0,10) || '?'} importieren? Überschreibt Portfolio (${data.portfolio.length}) und Watchlist (${data.watchlist?.length || 0}).`)) {
         e.target.value = '';
         return;
       }
@@ -3984,13 +3222,12 @@ function Onboarding({ onClose }) {
       footer={<PrimaryBtn onClick={onClose}>Los geht's</PrimaryBtn>}
     >
       <div className="space-y-3 text-neutral-300 text-sm">
-        <p>Analyse-Tool für dein Portfolio – nicht Trading-Journal. Zwei Kernfragen:</p>
+        <p>Analyse-Tool für dein Portfolio. Kern: lebende Due Diligence pro Position.</p>
         <ul className="space-y-2">
-          <li className="flex gap-2"><TrendingDown className="w-4 h-4 mt-0.5 text-orange-400" /> <span><b>Was soll ich verkaufen?</b> Pro Position: Coach-Frage, Tief-DD, Risiken/Catalysts pflegen.</span></li>
-          <li className="flex gap-2"><Eye className="w-4 h-4 mt-0.5 text-orange-400" /> <span><b>Was soll ich kaufen?</b> AI-Watchlist-Generator nach Thema, Trending in r/wsb, Tief-DD vor dem Kauf.</span></li>
-          <li className="flex gap-2"><MessageCircle className="w-4 h-4 mt-0.5 text-orange-400" /> <span><b>Coach</b>: kennt Portfolio + Watchlist + DD. Antworten pinnbar als Erkenntnisse 📌.</span></li>
-          <li className="flex gap-2"><Brain className="w-4 h-4 mt-0.5 text-orange-400" /> <span><b>Erkenntnisse</b>: Coach-Insights bleiben auf Dashboard + pro Position erhalten.</span></li>
-          <li className="flex gap-2"><Cloud className="w-4 h-4 mt-0.5 text-orange-400" /> <span><b>Sheets-Sync</b> in Einstellungen für eigene Analyse & Multi-Device.</span></li>
+          <li className="flex gap-2"><Home className="w-4 h-4 mt-0.5 text-orange-400" /> <span><b>Home</b>: Total CHF + AI-Verdicts (was halten / reduzieren / verkaufen / nachkaufen).</span></li>
+          <li className="flex gap-2"><Briefcase className="w-4 h-4 mt-0.5 text-orange-400" /> <span><b>Portfolio</b>: Positionen mit Verdict-Pill und DD-Alter. Per Klick: DD aktualisieren mit Diff-Preview.</span></li>
+          <li className="flex gap-2"><Eye className="w-4 h-4 mt-0.5 text-orange-400" /> <span><b>Watchlist</b>: Was research ich? AI-Generator nach Thema, eigene DD vor Kauf.</span></li>
+          <li className="flex gap-2"><MessageCircle className="w-4 h-4 mt-0.5 text-orange-400" /> <span><b>Coach</b>: kennt Portfolio + Watchlist + DDs. Kann DD-Updates vorschlagen (du bestätigst pro Feld).</span></li>
         </ul>
         <p className="text-neutral-500 text-xs">
           Alle Daten liegen lokal auf dem Gerät. Initial werden Demo-Daten geladen, die du frei anpassen kannst.
@@ -4008,13 +3245,12 @@ function BottomNav({ tab, setTab }) {
   const tabs = [
     { id: 'dashboard', icon: Home, label: 'Home' },
     { id: 'portfolio', icon: Briefcase, label: 'Portfolio' },
-    { id: 'trades', icon: ArrowLeftRight, label: 'Trades' },
     { id: 'watchlist', icon: Eye, label: 'Watchlist' },
     { id: 'coach', icon: MessageCircle, label: 'Coach' },
   ];
   return (
     <nav className="fixed bottom-0 left-0 right-0 bg-neutral-950/95 backdrop-blur border-t border-neutral-800 pb-[max(env(safe-area-inset-bottom),0.25rem)] z-40">
-      <div className="grid grid-cols-5 max-w-md mx-auto">
+      <div className="grid grid-cols-4 max-w-md mx-auto">
         {tabs.map((t) => {
           const Icon = t.icon;
           const active = tab === t.id;
@@ -4077,39 +3313,30 @@ function TopBar({ title, onSettings, onRefresh, refreshing, lastRefresh }) {
 export default function App() {
   const [tab, setTab] = useState('dashboard');
   const [portfolio, setPortfolio] = useState([]);
-  const [trades, setTrades] = useState([]);
   const [watchlist, setWatchlist] = useState([]);
   const [chatHistory, setChatHistory] = useState([]);
-  const [insights, setInsights] = useState([]);
   const [settings, setSettingsState] = useState({ fx: DEFAULT_FX });
   const [openPositionId, setOpenPositionId] = useState(null);
   const [portfolioInitialSort, setPortfolioInitialSort] = useState('mv');
   const [showAddPosition, setShowAddPosition] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [showInsights, setShowInsights] = useState(false);
-  const [pinDraft, setPinDraft] = useState(null);
   const [assessmentTrigger, setAssessmentTrigger] = useState(0);
-  const [pendingCoachQuestion, setPendingCoachQuestion] = useState(null);
   const [hydrated, setHydrated] = useState(false);
 
   // Initial Load
   useEffect(() => {
     (async () => {
-      const [p, t, w, c, ins, s, onb] = await Promise.all([
+      const [p, w, c, s, onb] = await Promise.all([
         storage.get('portfolio'),
-        storage.get('trades'),
         storage.get('watchlist'),
         storage.get('chatHistory'),
-        storage.get('insights'),
         storage.get('settings'),
         storage.get('onboardingSeen'),
       ]);
       setPortfolio(migrateDD(p ?? DEMO_PORTFOLIO));
-      setTrades(t ?? []);
       setWatchlist(w ?? DEMO_WATCHLIST);
       setChatHistory(c ?? []);
-      setInsights(Array.isArray(ins) ? ins : []);
       setSettingsState(s ?? { fx: DEFAULT_FX });
       if (!onb) setShowOnboarding(true);
       setHydrated(true);
@@ -4118,10 +3345,8 @@ export default function App() {
 
   // Persist
   useEffect(() => { if (hydrated) storage.set('portfolio', portfolio); }, [portfolio, hydrated]);
-  useEffect(() => { if (hydrated) storage.set('trades', trades); }, [trades, hydrated]);
   useEffect(() => { if (hydrated) storage.set('watchlist', watchlist); }, [watchlist, hydrated]);
   useEffect(() => { if (hydrated) storage.set('chatHistory', chatHistory); }, [chatHistory, hydrated]);
-  useEffect(() => { if (hydrated) storage.set('insights', insights); }, [insights, hydrated]);
   useEffect(() => { if (hydrated) storage.set('settings', settings); }, [settings, hydrated]);
 
   const fx = settings.fx || DEFAULT_FX;
@@ -4129,29 +3354,14 @@ export default function App() {
   // Position handlers
   const updatePosition = (pos) =>
     setPortfolio((arr) => arr.map((x) => (x.id === pos.id ? pos : x)));
-  const updatePositionWithCascade = (pos, oldTicker) => {
+  const updatePositionWithCascade = (pos /* oldTicker */) => {
+    // Trade-Log existiert nicht mehr – kein Cascade nötig. Signatur bleibt für Compat.
     setPortfolio((arr) => arr.map((x) => (x.id === pos.id ? pos : x)));
-    if (oldTicker && oldTicker !== pos.ticker) {
-      setTrades((arr) => arr.map((t) => (t.ticker === oldTicker ? { ...t, ticker: pos.ticker } : t)));
-    }
   };
   const deletePosition = (id) =>
     setPortfolio((arr) => arr.filter((x) => x.id !== id));
   const addPosition = (pos) => setPortfolio((arr) => [pos, ...arr]);
   const addPositions = (positions) => setPortfolio((arr) => [...positions, ...arr]);
-
-  const askCoach = (text) => {
-    setTab('coach');
-    setPendingCoachQuestion({ id: uid(), text });
-  };
-
-  // Insights: pinning + delete
-  const pinInsight = (text) => setPinDraft(text);
-  const saveInsight = (entry) => {
-    setInsights((arr) => [entry, ...arr].slice(0, 200));
-    setPinDraft(null);
-  };
-  const deleteInsight = (id) => setInsights((arr) => arr.filter((x) => x.id !== id));
 
   // DD-Updates aus dem Coach-Assessment auf eine Position anwenden.
   // update: { ticker, field, op: '+'|'-'|'=', value }
@@ -4262,10 +3472,6 @@ export default function App() {
     // eslint-disable-next-line
   }, [hydrated, settings.finnhubKey]);
 
-  // Trade handlers
-  const addTrade = (t) => setTrades((arr) => [t, ...arr]);
-  const deleteTrade = (id) => setTrades((arr) => arr.filter((x) => x.id !== id));
-
   // Watchlist handlers
   const addWatchlist = (w) => setWatchlist((arr) => [w, ...arr]);
   const addWatchlistMany = (items) => setWatchlist((arr) => [...items, ...arr]);
@@ -4292,8 +3498,7 @@ export default function App() {
   };
 
   const reset = () => {
-    setPortfolio(DEMO_PORTFOLIO);
-    setTrades([]);
+    setPortfolio(migrateDD(DEMO_PORTFOLIO));
     setWatchlist(DEMO_WATCHLIST);
     setChatHistory([]);
     setSettingsState({ fx: DEFAULT_FX });
@@ -4314,7 +3519,6 @@ export default function App() {
   const titleMap = {
     dashboard: 'Mein Finanz-Coach',
     portfolio: 'Portfolio',
-    trades: 'Trades',
     watchlist: 'Watchlist',
     coach: 'Coach',
   };
@@ -4342,10 +3546,7 @@ export default function App() {
           <Dashboard
             portfolio={portfolio}
             fx={fx}
-            insights={insights}
             onAssess={triggerAssessment}
-            onOpenPosition={(id) => setOpenPositionId(id)}
-            onOpenInsights={() => setShowInsights(true)}
             onOpenPortfolioByVerdict={() => { setPortfolioInitialSort('verdict'); setTab('portfolio'); }}
           />
         )}
@@ -4358,15 +3559,6 @@ export default function App() {
             onAddPosition={() => setShowAddPosition(true)}
           />
         )}
-        {tab === 'trades' && (
-          <TradesTab
-            trades={trades}
-            portfolio={portfolio}
-            fx={fx}
-            onAddTrade={addTrade}
-            onDeleteTrade={deleteTrade}
-          />
-        )}
         {tab === 'watchlist' && (
           <WatchlistTab
             watchlist={watchlist}
@@ -4377,13 +3569,11 @@ export default function App() {
             onRemove={removeWatchlist}
             onUpdate={updateWatchlist}
             onConvert={convertWatchlist}
-            onAskCoach={askCoach}
           />
         )}
         {tab === 'coach' && (
           <CoachTab
             portfolio={portfolio}
-            trades={trades}
             watchlist={watchlist}
             fx={fx}
             apiKey={settings.apiKey}
@@ -4392,11 +3582,8 @@ export default function App() {
             onAddWatchlistFromAI={addWatchlistFromAI}
             onApplyDDUpdate={applyDDUpdate}
             onApplyWatchlistDDUpdate={applyWatchlistDDUpdate}
-            onPinInsight={pinInsight}
             assessmentTrigger={assessmentTrigger}
             onAssessmentDone={() => {}}
-            pendingQuestion={pendingCoachQuestion}
-            onPendingQuestionConsumed={() => setPendingCoachQuestion(null)}
           />
         )}
 
@@ -4405,17 +3592,12 @@ export default function App() {
         {openPos && (
           <PositionDetail
             position={openPos}
-            trades={trades}
             fx={fx}
             apiKey={settings.apiKey}
-            insights={insights}
             onClose={() => setOpenPositionId(null)}
             onUpdate={updatePosition}
             onUpdateWithCascade={updatePositionWithCascade}
             onDelete={deletePosition}
-            onLogTrade={addTrade}
-            onAskCoach={askCoach}
-            onDeleteInsight={deleteInsight}
           />
         )}
 
@@ -4434,36 +3616,15 @@ export default function App() {
           setSettings={setSettingsState}
           onReset={reset}
           portfolio={portfolio}
-          trades={trades}
           watchlist={watchlist}
-          insights={insights}
           onImport={(data) => {
             setPortfolio(migrateDD(data.portfolio || []));
-            setTrades(Array.isArray(data.trades) ? data.trades : []);
             setWatchlist(Array.isArray(data.watchlist) ? data.watchlist : []);
-            if (Array.isArray(data.insights)) setInsights(data.insights);
             if (data.settings?.fx) {
               setSettingsState((s) => ({ ...s, fx: { ...DEFAULT_FX, ...data.settings.fx, CHF: 1 } }));
             }
           }}
         />
-
-        <InsightsModal
-          open={showInsights}
-          onClose={() => setShowInsights(false)}
-          insights={insights}
-          onDelete={deleteInsight}
-        />
-
-        {pinDraft != null && (
-          <PinInsightModal
-            initialText={pinDraft}
-            portfolio={portfolio}
-            watchlist={watchlist}
-            onClose={() => setPinDraft(null)}
-            onSave={saveInsight}
-          />
-        )}
 
         {showOnboarding && <Onboarding onClose={finishOnboarding} />}
       </div>
