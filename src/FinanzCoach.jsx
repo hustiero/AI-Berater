@@ -7,7 +7,7 @@ import {
   Settings as SettingsIcon, Send, RotateCcw,
   Sparkles, AlertTriangle, ChevronRight, Loader2, Check,
   Info, Pencil, Microscope,
-  Cloud, CloudUpload, CloudDownload, Copy,
+  Cloud, CloudUpload,
 } from 'lucide-react';
 
 /* =========================================================
@@ -29,23 +29,8 @@ const ASSET_CLASSES = [
   'Fund Tech', 'Fund Mixed', 'Gold ETF', 'Anleihe', 'Krypto', 'Sonstige',
 ];
 
-const DEMO_PORTFOLIO = [
-  { id: 'p1', ticker: 'NOVN', name: 'Novartis', assetClass: 'Aktie Pharma', shares: 200, costBasis: 53, currentPrice: 113.36, currency: 'CHF', purchaseDate: '2020-01-15', note: 'Solider Pharma-Anker mit Dividende', stopLoss: null },
-  { id: 'p2', ticker: 'ROG', name: 'Roche PC', assetClass: 'Aktie Pharma', shares: 50, costBasis: 202, currentPrice: 315.30, currency: 'CHF', purchaseDate: '2019-06-10', note: 'Diagnostics, defensiv', stopLoss: null },
-  { id: 'p3', ticker: 'BGFWT', name: 'BGF World Technology D2C', assetClass: 'Fund Tech', shares: 300, costBasis: 102, currentPrice: 162.70, currency: 'USD', purchaseDate: '2021-03-22', note: 'Breit gestreuter Tech-Fund', stopLoss: null },
-  { id: 'p4', ticker: 'CSGOLD', name: 'iShares Gold CHF hedged', assetClass: 'Gold ETF', shares: 150, costBasis: 130, currentPrice: 296.80, currency: 'CHF', purchaseDate: '2020-04-01', note: 'Krisen-Hedge', stopLoss: null },
-  { id: 'p5', ticker: 'SAAB-B', name: 'SAAB B', assetClass: 'Aktie Defense', shares: 22, costBasis: 586, currentPrice: 531, currency: 'SEK', purchaseDate: '2024-05-12', note: 'Defense-Welle EU', stopLoss: null },
-  { id: 'p6', ticker: 'AMS', name: 'AMS-Osram', assetClass: 'Aktie Halbleiter', shares: 83, costBasis: 18.20, currentPrice: 20.94, currency: 'CHF', purchaseDate: '2024-09-01', note: 'Turnaround Bet', stopLoss: null },
-  { id: 'p7', ticker: 'ALRIB', name: 'Riber', assetClass: 'Aktie Halbleiter', shares: 120, costBasis: 12.60, currentPrice: 13.82, currency: 'EUR', purchaseDate: '2024-10-15', note: 'MBE-Maschinen, AI-Infra Welle 2', stopLoss: null },
-  { id: 'p8', ticker: 'CEG', name: 'Constellation Energy', assetClass: 'Aktie Energy', shares: 5, costBasis: 270, currentPrice: 285.83, currency: 'USD', purchaseDate: '2024-08-22', note: 'AI-Power Welle 3', stopLoss: null },
-  { id: 'p9', ticker: 'ABBN', name: 'ABB', assetClass: 'Aktie Industrie', shares: 11, costBasis: 60, currentPrice: 83.50, currency: 'CHF', purchaseDate: '2023-11-05', note: 'Grid & Industrial AI', stopLoss: null },
-  { id: 'p10', ticker: 'UBSG', name: 'UBS', assetClass: 'Aktie Financials', shares: 19, costBasis: 25, currentPrice: 36.89, currency: 'CHF', purchaseDate: '2023-04-10', note: 'CS-Übernahme Story', stopLoss: null },
-];
-
-const DEMO_WATCHLIST = [
-  { id: 'w1', ticker: 'ENR', name: 'Siemens Energy', triggerPrice: 55, currency: 'EUR', thesis: 'Welle 3 AI-Power, Trafos-Knappheit', source: 'self', addedAt: new Date().toISOString() },
-  { id: 'w2', ticker: 'SU', name: 'Schneider Electric', triggerPrice: 220, currency: 'EUR', thesis: 'Datacenter-Kühlung & Stromverteilung', source: 'self', addedAt: new Date().toISOString() },
-];
+const DEMO_PORTFOLIO = [];
+const DEMO_WATCHLIST = [];
 
 /* =========================================================
    Storage (window.storage)
@@ -680,31 +665,73 @@ Regeln:
 }
 
 /* =========================================================
-   Google Apps Script Sync
+   Finanztracker-Apps-Script: Auth & AI-Berater Sync
    ========================================================= */
 
-async function gasPush(url, payload) {
-  if (!url) throw new Error('Apps-Script-URL fehlt.');
-  const r = await fetch(url, {
-    method: 'POST',
-    body: JSON.stringify({ action: 'push', ...payload }),
-  });
-  if (!r.ok) throw new Error(`Push ${r.status}`);
-  const d = await r.json();
-  if (d?.ok !== true) throw new Error(d?.error || 'Push fehlgeschlagen.');
-  return d;
+async function sha256Hex(text) {
+  const buf = new TextEncoder().encode(String(text));
+  const hash = await crypto.subtle.digest('SHA-256', buf);
+  return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function gasPull(url) {
-  if (!url) throw new Error('Apps-Script-URL fehlt.');
-  const r = await fetch(url, {
-    method: 'POST',
-    body: JSON.stringify({ action: 'pull' }),
+// Zentrale API-Call-Funktion. params = { action, ...weitere }. Wenn token
+// gesetzt ist, wird er als Query-Param mitgeschickt.
+async function apiCall(adminUrl, params) {
+  if (!adminUrl) throw new Error('Apps-Script-URL fehlt.');
+  // POST mit text/plain body (kein CORS-Preflight). Google-Apps-Script doGet
+  // unterstützt auch GET — wir nutzen GET mit URL-Encoded-Params für maximale
+  // Kompatibilität mit dem existierenden Finanztracker-Setup.
+  const usp = new URLSearchParams();
+  Object.keys(params || {}).forEach((k) => {
+    const v = params[k];
+    if (v == null) return;
+    usp.set(k, typeof v === 'string' ? v : JSON.stringify(v));
   });
-  if (!r.ok) throw new Error(`Pull ${r.status}`);
+  const url = `${adminUrl}?${usp.toString()}`;
+  const r = await fetch(url, { method: 'GET' });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const d = await r.json();
-  if (d?.ok !== true) throw new Error(d?.error || 'Pull fehlgeschlagen.');
-  return d.data || {};
+  if (d && d.error) throw new Error(d.error);
+  return d || {};
+}
+
+async function authLogin(adminUrl, username, password) {
+  const hash = await sha256Hex(password);
+  const d = await apiCall(adminUrl, { action: 'login', user: username.trim().toLowerCase(), hash });
+  if (!d.ok || !d.token) throw new Error(d.error || 'Login fehlgeschlagen.');
+  return { token: d.token, username: d.username || username, role: d.role || 'user' };
+}
+
+async function authGetMe(adminUrl, token) {
+  return apiCall(adminUrl, { action: 'get_me', token });
+}
+
+async function aiPull(adminUrl, token) {
+  const d = await apiCall(adminUrl, { action: 'ai_pull', token });
+  return {
+    portfolio: Array.isArray(d.portfolio) ? d.portfolio : [],
+    watchlist: Array.isArray(d.watchlist) ? d.watchlist : [],
+    chatHistory: Array.isArray(d.chatHistory) ? d.chatHistory : [],
+  };
+}
+
+async function aiPush(adminUrl, token, { portfolio, watchlist, chatHistory }) {
+  return apiCall(adminUrl, {
+    action: 'ai_push',
+    token,
+    portfolio: JSON.stringify(portfolio || []),
+    watchlist: JSON.stringify(watchlist || []),
+    chatHistory: JSON.stringify(chatHistory || []),
+  });
+}
+
+async function aiClearChat(adminUrl, token) {
+  return apiCall(adminUrl, { action: 'ai_clear_chat', token });
+}
+
+async function stockSearch(adminUrl, token, query) {
+  const d = await apiCall(adminUrl, { action: 'stock_search', token, query });
+  return Array.isArray(d.quotes) ? d.quotes : [];
 }
 
 /* =========================================================
@@ -1910,7 +1937,7 @@ function PositionDetail({ position, fx, onClose, onUpdate, onDelete, apiKey, onU
    Add Position Modal
    ========================================================= */
 
-function AddPositionModal({ open, onClose, onAddMany, apiKey, finnhubKey }) {
+function AddPositionModal({ open, onClose, onAddMany, apiKey, finnhubKey, adminUrl, token }) {
   const [form, setForm] = useState({ ticker: '', shares: '', costBasis: '', currency: 'auto' });
   const [drafts, setDrafts] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -2001,20 +2028,24 @@ function AddPositionModal({ open, onClose, onAddMany, apiKey, finnhubKey }) {
         <p className="text-xs text-neutral-400 mb-3">
           Nur das Nötigste eingeben. Name, Kurs, Asset-Klasse & These holt die AI per Yahoo/Finnhub-Daten in einem Rutsch.
         </p>
-        <div className="grid grid-cols-2 gap-3">
-          <TextField
-            label="Ticker"
-            value={form.ticker}
-            onChange={(v) => set('ticker', v)}
-            placeholder="NOVN, AAPL, ROG.SW"
-          />
-          <SelectField
-            label="Währung"
-            value={form.currency}
-            onChange={(v) => set('currency', v)}
-            options={['auto', ...CURRENCIES]}
-          />
-        </div>
+        <TickerSearchField
+          label="Ticker (Name oder Symbol suchen)"
+          value={form.ticker}
+          onChange={(v) => set('ticker', v)}
+          onPick={(q) => {
+            const ccy = (q.currency || '').toUpperCase();
+            if (CURRENCIES.includes(ccy)) setForm((f) => ({ ...f, ticker: q.symbol, currency: ccy }));
+          }}
+          adminUrl={adminUrl}
+          token={token}
+          placeholder="z.B. Novartis oder NOVN.SW"
+        />
+        <SelectField
+          label="Währung"
+          value={form.currency}
+          onChange={(v) => set('currency', v)}
+          options={['auto', ...CURRENCIES]}
+        />
         <div className="grid grid-cols-2 gap-3">
           <TextField
             label="Anzahl"
@@ -2464,7 +2495,7 @@ function ConvertToPositionModal({ item, onClose, onConfirm }) {
    Coach (AI Chat) Tab
    ========================================================= */
 
-function CoachTab({ portfolio, watchlist, fx, apiKey, chatHistory, setChatHistory, onAddWatchlistFromAI, onApplyDDUpdate, onApplyWatchlistDDUpdate, assessmentTrigger, onAssessmentDone }) {
+function CoachTab({ portfolio, watchlist, fx, apiKey, chatHistory, setChatHistory, onAddWatchlistFromAI, onApplyDDUpdate, onApplyWatchlistDDUpdate, assessmentTrigger, onAssessmentDone, onClearChatInSheet }) {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
@@ -2641,7 +2672,7 @@ ${watchlistSummary.map((x) => JSON.stringify(x)).join('\n') || '(leer)'}`;
       .trim();
 
   const newChat = () => {
-    if (confirm('Chatverlauf löschen?')) setChatHistory([]);
+    if (confirm('Lokalen Chatverlauf zurücksetzen? (Wird beim nächsten Speichern auch im Sheet aktualisiert.)')) setChatHistory([]);
   };
 
   return (
@@ -2651,9 +2682,16 @@ ${watchlistSummary.map((x) => JSON.stringify(x)).join('\n') || '(leer)'}`;
           <Sparkles className="w-5 h-5 text-orange-400" />
           <h2 className="text-white font-semibold">Finanz-Coach</h2>
         </div>
-        <button onClick={newChat} className="flex items-center gap-1 text-neutral-400 text-sm">
-          <RotateCcw className="w-4 h-4" /> Neuer Chat
-        </button>
+        <div className="flex items-center gap-3">
+          <button onClick={newChat} className="flex items-center gap-1 text-neutral-400 text-xs hover:text-neutral-200">
+            <RotateCcw className="w-3.5 h-3.5" /> Neu
+          </button>
+          {onClearChatInSheet && (
+            <button onClick={onClearChatInSheet} className="flex items-center gap-1 text-neutral-500 text-xs hover:text-red-400" title="Chat-Verlauf im Sheet löschen">
+              <Trash2 className="w-3.5 h-3.5" /> Sheet
+            </button>
+          )}
+        </div>
       </div>
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 pb-2 space-y-3">
@@ -2886,200 +2924,24 @@ function SuggestionCard({ suggestion, onAccept }) {
 }
 
 /* =========================================================
-   Apps-Script-Quelltext (in Sheet → Apps Script einfügen)
-   ========================================================= */
-
-const APPS_SCRIPT_SOURCE = `// AI-Berater – Google-Sheets-Sync
-// Bereitstellen: Web-App, ausführen als ICH, Zugriff JEDER (mit Link)
-const TABS = { portfolio: 'Portfolio', trades: 'Trades', watchlist: 'Watchlist' };
-const SCHEMA = {
-  portfolio: ['id','ticker','name','assetClass','shares','costBasis','currentPrice','currency','purchaseDate','note','stopLoss','lastQuoteAt','quoteSource','dueDiligence'],
-  trades: ['id','date','side','ticker','name','shares','price','currency','fee','note'],
-  watchlist: ['id','ticker','name','triggerPrice','currency','thesis','source','addedAt','dueDiligence'],
-};
-
-function doPost(e) {
-  try {
-    const req = JSON.parse(e.postData.contents || '{}');
-    if (req.action === 'push') return jsonResp({ ok: true, ...pushAll(req) });
-    if (req.action === 'pull') return jsonResp({ ok: true, data: pullAll() });
-    return jsonResp({ ok: false, error: 'Unknown action' });
-  } catch (err) {
-    return jsonResp({ ok: false, error: String(err) });
-  }
-}
-
-function jsonResp(obj) {
-  return ContentService
-    .createTextOutput(JSON.stringify(obj))
-    .setMimeType(ContentService.MimeType.JSON);
-}
-
-function pushAll(req) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  ['portfolio','trades','watchlist'].forEach((k) => {
-    const tabName = TABS[k];
-    const rows = Array.isArray(req[k]) ? req[k] : [];
-    let sh = ss.getSheetByName(tabName);
-    if (!sh) sh = ss.insertSheet(tabName);
-    sh.clear();
-    const cols = SCHEMA[k];
-    const data = [cols].concat(rows.map((r) => cols.map((c) => {
-      const v = r[c];
-      if (c === 'dueDiligence') return v ? JSON.stringify(v) : '';
-      if (v == null) return '';
-      return v;
-    })));
-    sh.getRange(1, 1, data.length, cols.length).setValues(data);
-  });
-  return { counts: {
-    portfolio: (req.portfolio || []).length,
-    trades: (req.trades || []).length,
-    watchlist: (req.watchlist || []).length,
-  }};
-}
-
-function pullAll() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const out = { portfolio: [], trades: [], watchlist: [] };
-  ['portfolio','trades','watchlist'].forEach((k) => {
-    const sh = ss.getSheetByName(TABS[k]);
-    if (!sh) return;
-    const vals = sh.getDataRange().getValues();
-    if (vals.length < 2) return;
-    const header = vals[0].map(String);
-    for (let i = 1; i < vals.length; i++) {
-      const row = vals[i];
-      if (!row[0]) continue;
-      const obj = {};
-      header.forEach((h, idx) => {
-        let v = row[idx];
-        if (h === 'dueDiligence' && typeof v === 'string' && v.length > 0) {
-          try { v = JSON.parse(v); } catch (e) { v = null; }
-        }
-        if (['shares','costBasis','currentPrice','stopLoss','price','fee','triggerPrice'].indexOf(h) >= 0 && v !== '' && v != null) {
-          v = Number(v);
-        }
-        obj[h] = v === '' ? null : v;
-      });
-      out[k].push(obj);
-    }
-  });
-  return out;
-}
-`;
-
-/* =========================================================
    Settings Modal
    ========================================================= */
 
-function SettingsModal({ open, onClose, settings, setSettings, onReset, portfolio, watchlist, onImport }) {
+function SettingsModal({ open, onClose, settings, setSettings, onReset, session, onLogout }) {
   const [fx, setFx] = useState(settings.fx);
   const [apiKey, setApiKey] = useState(settings.apiKey || '');
   const [finnhubKey, setFinnhubKey] = useState(settings.finnhubKey || '');
-  const [gasUrl, setGasUrl] = useState(settings.gasUrl || '');
-  const [importErr, setImportErr] = useState('');
-  const [syncStatus, setSyncStatus] = useState('');
-  const [syncErr, setSyncErr] = useState('');
-  const [syncBusy, setSyncBusy] = useState(false);
-  const [setupOpen, setSetupOpen] = useState(false);
-  const fileInputRef = useRef(null);
   useEffect(() => {
     setFx(settings.fx);
     setApiKey(settings.apiKey || '');
     setFinnhubKey(settings.finnhubKey || '');
-    setGasUrl(settings.gasUrl || '');
-    setImportErr('');
-    setSyncErr('');
-    setSyncStatus('');
-  }, [settings.fx, settings.apiKey, settings.finnhubKey, settings.gasUrl, open]);
-
-  const doSyncPush = async () => {
-    setSyncBusy(true); setSyncErr(''); setSyncStatus('');
-    try {
-      const url = gasUrl.trim();
-      // trades:[] für Backwards-Compat mit Apps-Script (Trades-Tab im Sheet bleibt leer)
-      await gasPush(url, { portfolio, trades: [], watchlist });
-      setSyncStatus(`Push OK – ${new Date().toLocaleString('de-CH')}`);
-      setSettings({ ...settings, gasUrl: url, lastSheetSyncAt: Date.now(), lastSheetSyncKind: 'push' });
-    } catch (e) {
-      setSyncErr(e.message || 'Push fehlgeschlagen.');
-    } finally {
-      setSyncBusy(false);
-    }
-  };
-  const doSyncPull = async () => {
-    if (!confirm('Pull überschreibt deine lokalen Daten (Portfolio, Trades, Watchlist). Fortfahren?')) return;
-    setSyncBusy(true); setSyncErr(''); setSyncStatus('');
-    try {
-      const url = gasUrl.trim();
-      const data = await gasPull(url);
-      onImport(data);
-      setSyncStatus(`Pull OK – ${new Date().toLocaleString('de-CH')}`);
-      setSettings({ ...settings, gasUrl: url, lastSheetSyncAt: Date.now(), lastSheetSyncKind: 'pull' });
-    } catch (e) {
-      setSyncErr(e.message || 'Pull fehlgeschlagen.');
-    } finally {
-      setSyncBusy(false);
-    }
-  };
-
-  const copyScript = async () => {
-    try {
-      await navigator.clipboard.writeText(APPS_SCRIPT_SOURCE);
-      setSyncStatus('Code kopiert.');
-      setTimeout(() => setSyncStatus(''), 2000);
-    } catch {
-      setSyncErr('Clipboard nicht verfügbar.');
-    }
-  };
-
-  const exportData = () => {
-    const payload = {
-      version: 3,
-      exportedAt: new Date().toISOString(),
-      portfolio,
-      watchlist,
-      settings: { fx: settings.fx }, // KEINE API-Keys exportieren
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `ai-berater-backup-${new Date().toISOString().slice(0, 10)}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  };
-
-  const handleImportFile = async (e) => {
-    setImportErr('');
-    const file = e.target.files?.[0];
-    if (!file) return;
-    try {
-      const txt = await file.text();
-      const data = JSON.parse(txt);
-      if (!data || !Array.isArray(data.portfolio)) throw new Error('Ungültiges Backup-Format (portfolio fehlt).');
-      if (!confirm(`Backup vom ${data.exportedAt?.slice(0,10) || '?'} importieren? Überschreibt Portfolio (${data.portfolio.length}) und Watchlist (${data.watchlist?.length || 0}).`)) {
-        e.target.value = '';
-        return;
-      }
-      onImport(data);
-      onClose();
-    } catch (err) {
-      setImportErr(err.message || 'Import fehlgeschlagen.');
-    } finally {
-      e.target.value = '';
-    }
-  };
+  }, [settings.fx, settings.apiKey, settings.finnhubKey, open]);
 
   const save = () => {
     setSettings({
       ...settings,
       apiKey: apiKey.trim(),
       finnhubKey: finnhubKey.trim(),
-      gasUrl: gasUrl.trim(),
       fx: {
         CHF: 1,
         USD: parseFloat(fx.USD) || DEFAULT_FX.USD,
@@ -3090,9 +2952,6 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset, portfoli
     onClose();
   };
 
-  const lastSync = settings.lastSheetSyncAt;
-  const lastSyncAgo = lastSync ? Math.max(0, Math.round((Date.now() - lastSync) / 60000)) : null;
-
   return (
     <Modal
       open={open}
@@ -3100,6 +2959,22 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset, portfoli
       title="Einstellungen"
       footer={<PrimaryBtn onClick={save}>Speichern</PrimaryBtn>}
     >
+      <Card className="p-4 mb-3">
+        <h4 className="text-white font-semibold mb-2 flex items-center gap-1.5">
+          <Cloud className="w-4 h-4 text-orange-400" /> Account
+        </h4>
+        {session ? (
+          <div>
+            <p className="text-sm text-neutral-300 mb-1">Angemeldet als <span className="text-white font-medium">{session.username}</span></p>
+            <p className="text-[11px] text-neutral-500 mb-3 break-all">{session.adminUrl}</p>
+            <GhostBtn onClick={() => { if (confirm('Wirklich abmelden? Ungespeicherte Änderungen gehen verloren.')) onLogout(); }}>
+              Abmelden
+            </GhostBtn>
+          </div>
+        ) : (
+          <p className="text-neutral-500 text-xs">Nicht angemeldet.</p>
+        )}
+      </Card>
       <Card className="p-4 mb-3">
         <h4 className="text-white font-semibold mb-2">Anthropic API-Key</h4>
         <p className="text-neutral-400 text-xs mb-2">
@@ -3110,8 +2985,7 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset, portfoli
       <Card className="p-4 mb-3">
         <h4 className="text-white font-semibold mb-2">Finnhub API-Key (Live-Kurse)</h4>
         <p className="text-neutral-400 text-xs mb-2">
-          Optional, aber empfohlen. Free-Plan auf finnhub.io (60 Calls/Min, hauptsächlich US-Aktien).
-          Schweizer/EU-Aktien werden automatisch über Yahoo (corsproxy.io) geholt.
+          Optional. Free-Plan auf finnhub.io. Für CH/EU-Aktien nicht zwingend – Yahoo-Fallback greift.
         </p>
         <TextField label="Finnhub Token" type="password" value={finnhubKey} onChange={setFinnhubKey} placeholder="cv…" />
       </Card>
@@ -3121,87 +2995,13 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset, portfoli
         <TextField label="1 EUR =" type="number" step="0.0001" value={fx.EUR} onChange={(v) => setFx({ ...fx, EUR: v })} />
         <TextField label="1 SEK =" type="number" step="0.0001" value={fx.SEK} onChange={(v) => setFx({ ...fx, SEK: v })} />
       </Card>
-      <Card className="p-4 mb-3">
-        <h4 className="text-white font-semibold mb-2 flex items-center gap-1.5">
-          <Cloud className="w-4 h-4 text-orange-400" /> Google-Sheets-Sync
-        </h4>
-        <p className="text-neutral-400 text-xs mb-2">
-          Multi-Device & eigene Analysen in Sheets. Push überschreibt das Sheet, Pull überschreibt lokal („Last writer wins").
-        </p>
-        <TextField label="Apps-Script Web-App URL" type="password" value={gasUrl} onChange={setGasUrl} placeholder="https://script.google.com/macros/s/.../exec" />
-        <div className="grid grid-cols-2 gap-2 mb-2">
-          <GhostBtn onClick={doSyncPush} className={syncBusy || !gasUrl ? 'opacity-50 pointer-events-none' : ''}>
-            <span className="flex items-center justify-center gap-1.5"><CloudUpload className="w-4 h-4" /> Push</span>
-          </GhostBtn>
-          <GhostBtn onClick={doSyncPull} className={syncBusy || !gasUrl ? 'opacity-50 pointer-events-none' : ''}>
-            <span className="flex items-center justify-center gap-1.5"><CloudDownload className="w-4 h-4" /> Pull</span>
-          </GhostBtn>
-        </div>
-        {syncBusy && <p className="text-orange-400 text-xs flex items-center gap-1.5"><Spinner size={3} /> Synchronisiere…</p>}
-        {syncStatus && !syncBusy && <p className="text-green-400 text-xs">{syncStatus}</p>}
-        {syncErr && (
-          <div className="mt-2 text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
-            <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {syncErr}
-          </div>
-        )}
-        {lastSync && !syncStatus && (
-          <p className="text-neutral-500 text-[11px] mt-1">
-            Letzter {settings.lastSheetSyncKind === 'pull' ? 'Pull' : 'Push'} {lastSyncAgo === 0 ? 'gerade' : `vor ${lastSyncAgo} Min`}
-          </p>
-        )}
-        <button
-          onClick={() => setSetupOpen((x) => !x)}
-          className="mt-3 flex items-center gap-1 text-xs text-neutral-400 hover:text-neutral-200"
-        >
-          <ChevronRight className={`w-3.5 h-3.5 transition-transform ${setupOpen ? 'rotate-90' : ''}`} />
-          Setup-Anleitung
-        </button>
-        {setupOpen && (
-          <div className="mt-2 text-xs text-neutral-400 space-y-2">
-            <ol className="list-decimal pl-4 space-y-1">
-              <li>Neues Google-Sheet anlegen → Erweiterungen → Apps Script.</li>
-              <li>Code unten kopieren, in <code>Code.gs</code> einfügen, speichern.</li>
-              <li>Bereitstellen → Neue Bereitstellung → Web-App → „Jeder" → URL hier oben einfügen.</li>
-              <li>Push klicken → drei Tabs erscheinen im Sheet.</li>
-            </ol>
-            <button
-              onClick={copyScript}
-              className="flex items-center gap-1.5 bg-neutral-800 hover:bg-neutral-700 text-white px-3 py-1.5 rounded-lg text-xs"
-            >
-              <Copy className="w-3.5 h-3.5" /> Apps-Script-Code kopieren
-            </button>
-          </div>
-        )}
-      </Card>
-      <Card className="p-4 mb-3">
-        <h4 className="text-white font-semibold mb-1">Backup (Export / Import)</h4>
-        <p className="text-neutral-400 text-xs mb-3">
-          Deine Daten leben nur in diesem Browser. Mach regelmässig Backups – inkl. Due-Diligence-Notizen.
-          API-Keys werden aus Sicherheitsgründen NICHT exportiert.
-        </p>
-        <div className="grid grid-cols-2 gap-2">
-          <GhostBtn onClick={exportData}>Exportieren</GhostBtn>
-          <GhostBtn onClick={() => fileInputRef.current?.click()}>Importieren</GhostBtn>
-        </div>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="application/json"
-          onChange={handleImportFile}
-          className="hidden"
-        />
-        {importErr && (
-          <div className="mt-2 text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
-            <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {importErr}
-          </div>
-        )}
-      </Card>
       <Card className="p-4">
-        <h4 className="text-white font-semibold mb-2">Daten zurücksetzen</h4>
+        <h4 className="text-white font-semibold mb-2">Lokale Session zurücksetzen</h4>
         <p className="text-neutral-400 text-xs mb-3">
-          Setzt Portfolio, Trades, Watchlist und Chatverlauf auf die Demo-Daten zurück.
+          Setzt lokalen State (Portfolio, Watchlist, Chat) zurück. Beim nächsten Save überschreibt das Sheet.
+          Falls du nur das Sheet behalten willst, einfach abmelden und neu anmelden.
         </p>
-        <GhostBtn onClick={() => { if (confirm('Wirklich alle Daten zurücksetzen?')) { onReset(); onClose(); } }}>
+        <GhostBtn onClick={() => { if (confirm('Lokale Session wirklich zurücksetzen?')) { onReset(); onClose(); } }}>
           Zurücksetzen
         </GhostBtn>
       </Card>
@@ -3212,6 +3012,173 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset, portfoli
 /* =========================================================
    Onboarding
    ========================================================= */
+
+/* =========================================================
+   Login Screen
+   ========================================================= */
+
+function LoginScreen({ initialAdminUrl, onLogin }) {
+  const [adminUrl, setAdminUrl] = useState(initialAdminUrl || '');
+  const [user, setUser] = useState('');
+  const [pw, setPw] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const submit = async () => {
+    setErr('');
+    if (!adminUrl.trim()) return setErr('Apps-Script-URL fehlt.');
+    if (!user.trim()) return setErr('Benutzername fehlt.');
+    if (!pw) return setErr('Passwort fehlt.');
+    setBusy(true);
+    try {
+      const session = await authLogin(adminUrl.trim(), user, pw);
+      onLogin({ adminUrl: adminUrl.trim(), token: session.token, username: session.username });
+    } catch (e) {
+      setErr(e.message || 'Login fehlgeschlagen.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-black text-white font-sans antialiased flex items-center justify-center px-4">
+      <div className="w-full max-w-sm">
+        <div className="text-center mb-6">
+          <Sparkles className="w-12 h-12 text-orange-400 mx-auto mb-3" />
+          <h1 className="text-2xl font-bold">Mein Finanz-Coach</h1>
+          <p className="text-sm text-neutral-400 mt-1">Anmelden mit deinem Finanztracker-Konto</p>
+        </div>
+        <Card className="p-5">
+          <TextField label="Apps-Script-URL" value={adminUrl} onChange={setAdminUrl} placeholder="https://script.google.com/macros/s/…/exec" />
+          <TextField label="Benutzername" value={user} onChange={setUser} placeholder="dein-name" />
+          <TextField label="Passwort" type="password" value={pw} onChange={setPw} />
+          {err && (
+            <div className="mb-3 text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {err}
+            </div>
+          )}
+          <PrimaryBtn onClick={submit} disabled={busy}>
+            {busy ? <span className="flex items-center justify-center gap-2"><Spinner size={4} /> Anmelden…</span> : 'Anmelden'}
+          </PrimaryBtn>
+        </Card>
+        <p className="text-[11px] text-neutral-500 text-center mt-4">
+          Gleiche Credentials wie Finanztracker. Apps-Script-URL bekommst du vom Admin.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================
+   Floating Save Button
+   ========================================================= */
+
+function SaveButton({ dirty, saving, lastSavedAt, error, onSave }) {
+  if (!dirty && !saving && !error) return null;
+  const label = saving
+    ? 'Speichere…'
+    : error
+    ? '⚠ Erneut versuchen'
+    : '● Speichern';
+  const ago = lastSavedAt ? Math.max(0, Math.round((Date.now() - lastSavedAt) / 60000)) : null;
+  return (
+    <div className="fixed bottom-[5.5rem] right-4 z-50 flex flex-col items-end gap-1">
+      {ago != null && !dirty && !saving && !error && (
+        <span className="text-[10px] text-neutral-500">vor {ago} Min gespeichert</span>
+      )}
+      <button
+        onClick={onSave}
+        disabled={saving}
+        className={`flex items-center gap-2 px-4 py-2.5 rounded-full shadow-lg font-semibold transition active:scale-95 disabled:opacity-70 ${
+          error ? 'bg-red-500 text-white' : 'bg-orange-500 text-black hover:bg-orange-400'
+        }`}
+        title={error || ''}
+      >
+        {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CloudUpload className="w-4 h-4" />}
+        <span className="text-sm">{label}</span>
+      </button>
+    </div>
+  );
+}
+
+/* =========================================================
+   Ticker-Search Autocomplete
+   ========================================================= */
+
+function TickerSearchField({ label, value, onChange, onPick, adminUrl, token, placeholder }) {
+  const [query, setQuery] = useState(value || '');
+  const [results, setResults] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [open, setOpen] = useState(false);
+  const debounceRef = useRef(null);
+
+  useEffect(() => { setQuery(value || ''); }, [value]);
+
+  const handleChange = (v) => {
+    setQuery(v);
+    onChange(v);
+    setOpen(true);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (!v || v.length < 2) {
+      setResults([]); return;
+    }
+    debounceRef.current = setTimeout(async () => {
+      setLoading(true);
+      try {
+        const quotes = await stockSearch(adminUrl, token, v);
+        setResults(quotes);
+      } catch {
+        setResults([]);
+      } finally {
+        setLoading(false);
+      }
+    }, 300);
+  };
+
+  const pick = (q) => {
+    onChange(q.symbol);
+    setQuery(q.symbol);
+    setOpen(false);
+    setResults([]);
+    onPick?.(q);
+  };
+
+  return (
+    <div className="mb-3 relative">
+      <label className="block text-xs font-medium text-neutral-400 mb-1">{label}</label>
+      <input
+        type="text"
+        value={query}
+        onChange={(e) => handleChange(e.target.value)}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        placeholder={placeholder || 'Name oder Ticker'}
+        className="w-full bg-neutral-900 border border-neutral-700 rounded-xl px-3 py-2.5 text-white placeholder-neutral-500 focus:outline-none focus:border-orange-500"
+      />
+      {open && (results.length > 0 || loading) && (
+        <div className="absolute left-0 right-0 mt-1 bg-neutral-950 border border-neutral-700 rounded-xl shadow-2xl z-40 max-h-72 overflow-y-auto">
+          {loading && (
+            <div className="px-3 py-2 text-xs text-neutral-400 flex items-center gap-2"><Spinner size={3} /> Suche…</div>
+          )}
+          {results.map((q) => (
+            <button
+              key={q.symbol}
+              onMouseDown={(e) => { e.preventDefault(); pick(q); }}
+              className="w-full text-left px-3 py-2 hover:bg-neutral-800 border-b border-neutral-800 last:border-b-0"
+            >
+              <p className="text-white text-sm font-medium">{q.symbol}</p>
+              <p className="text-neutral-400 text-xs truncate">
+                {q.shortname}
+                {q.exchange && <span className="text-neutral-500"> · {q.exchange}</span>}
+                {q.currency && <span className="text-neutral-500"> · {q.currency}</span>}
+              </p>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function Onboarding({ onClose }) {
   return (
@@ -3322,46 +3289,153 @@ export default function App() {
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [assessmentTrigger, setAssessmentTrigger] = useState(0);
-  const [hydrated, setHydrated] = useState(false);
 
-  // Initial Load
+  // Session & Save-State
+  const [session, setSession] = useState(null); // { adminUrl, token, username }
+  const [bootstrapPhase, setBootstrapPhase] = useState('booting'); // 'booting' | 'login' | 'loading' | 'ready'
+  const [bootstrapErr, setBootstrapErr] = useState('');
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState('');
+  const [lastSavedAt, setLastSavedAt] = useState(null);
+
+  const markDirty = () => setDirty(true);
+
+  // Step 1: bootstrap — check session + draft buffer
   useEffect(() => {
     (async () => {
-      const [p, w, c, s, onb] = await Promise.all([
-        storage.get('portfolio'),
-        storage.get('watchlist'),
-        storage.get('chatHistory'),
-        storage.get('settings'),
-        storage.get('onboardingSeen'),
-      ]);
-      setPortfolio(migrateDD(p ?? DEMO_PORTFOLIO));
-      setWatchlist(w ?? DEMO_WATCHLIST);
-      setChatHistory(c ?? []);
-      setSettingsState(s ?? { fx: DEFAULT_FX });
+      const stored = await storage.get('session');
+      const onb = await storage.get('onboardingSeen');
+      const s = await storage.get('settings');
+      if (s) setSettingsState(s);
       if (!onb) setShowOnboarding(true);
-      setHydrated(true);
+      if (stored && stored.token && stored.adminUrl) {
+        // Try token. If valid → load sheet.
+        try {
+          const me = await authGetMe(stored.adminUrl, stored.token);
+          if (me && me.username) {
+            const next = { adminUrl: stored.adminUrl, token: stored.token, username: me.username };
+            setSession(next);
+            setBootstrapPhase('loading');
+            await loadFromSheet(next);
+            return;
+          }
+        } catch {
+          // token invalid → fall through to login
+        }
+        await storage.remove('session');
+      }
+      setBootstrapPhase('login');
     })();
+    // eslint-disable-next-line
   }, []);
 
-  // Persist
-  useEffect(() => { if (hydrated) storage.set('portfolio', portfolio); }, [portfolio, hydrated]);
-  useEffect(() => { if (hydrated) storage.set('watchlist', watchlist); }, [watchlist, hydrated]);
-  useEffect(() => { if (hydrated) storage.set('chatHistory', chatHistory); }, [chatHistory, hydrated]);
-  useEffect(() => { if (hydrated) storage.set('settings', settings); }, [settings, hydrated]);
+  const loadFromSheet = async (sess) => {
+    setBootstrapErr('');
+    try {
+      const data = await aiPull(sess.adminUrl, sess.token);
+      // Local draft kicks in only if sheet is empty AND draft is non-empty
+      const draftP = await storage.get('portfolio');
+      const draftW = await storage.get('watchlist');
+      const draftC = await storage.get('chatHistory');
+      const sheetEmpty = data.portfolio.length === 0 && data.watchlist.length === 0 && data.chatHistory.length === 0;
+      const draftExists = (Array.isArray(draftP) && draftP.length > 0) || (Array.isArray(draftW) && draftW.length > 0) || (Array.isArray(draftC) && draftC.length > 0);
+      if (sheetEmpty && draftExists) {
+        const useDraft = confirm('Lokale Drafts vorhanden, Sheet ist leer. Drafts laden? (Cancel = leeren Zustand verwenden)');
+        if (useDraft) {
+          setPortfolio(migrateDD(draftP || []));
+          setWatchlist(Array.isArray(draftW) ? draftW : []);
+          setChatHistory(Array.isArray(draftC) ? draftC : []);
+          setDirty(true); // muss noch gepusht werden
+          setBootstrapPhase('ready');
+          return;
+        }
+      }
+      setPortfolio(migrateDD(data.portfolio));
+      setWatchlist(data.watchlist);
+      setChatHistory(data.chatHistory);
+      setDirty(false);
+      setLastSavedAt(Date.now());
+      setBootstrapPhase('ready');
+    } catch (e) {
+      setBootstrapErr(e.message || 'Sheet konnte nicht geladen werden.');
+      setBootstrapPhase('login');
+      await storage.remove('session');
+    }
+  };
+
+  const handleLogin = async (sess) => {
+    await storage.set('session', sess);
+    setSession(sess);
+    setBootstrapPhase('loading');
+    await loadFromSheet(sess);
+  };
+
+  const handleLogout = async () => {
+    await storage.remove('session');
+    await storage.remove('portfolio');
+    await storage.remove('watchlist');
+    await storage.remove('chatHistory');
+    setSession(null);
+    setPortfolio([]);
+    setWatchlist([]);
+    setChatHistory([]);
+    setDirty(false);
+    setSaveError('');
+    setLastSavedAt(null);
+    setShowSettings(false);
+    setBootstrapPhase('login');
+  };
+
+  // Draft-Buffer: localStorage hält Working-Copy, falls Browser-Refresh
+  useEffect(() => { if (bootstrapPhase === 'ready') storage.set('portfolio', portfolio); }, [portfolio, bootstrapPhase]);
+  useEffect(() => { if (bootstrapPhase === 'ready') storage.set('watchlist', watchlist); }, [watchlist, bootstrapPhase]);
+  useEffect(() => { if (bootstrapPhase === 'ready') storage.set('chatHistory', chatHistory); }, [chatHistory, bootstrapPhase]);
+  useEffect(() => { storage.set('settings', settings); }, [settings]);
+
+  // Save: ai_push, dirty zurücksetzen
+  const doSave = async () => {
+    if (!session || saving) return;
+    setSaving(true); setSaveError('');
+    try {
+      await aiPush(session.adminUrl, session.token, { portfolio, watchlist, chatHistory });
+      setDirty(false);
+      setLastSavedAt(Date.now());
+    } catch (e) {
+      setSaveError(e.message || 'Save fehlgeschlagen.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // beforeunload-Warnung bei dirty
+  useEffect(() => {
+    const handler = (e) => {
+      if (!dirty) return;
+      e.preventDefault();
+      e.returnValue = 'Ungespeicherte Änderungen — wirklich verlassen?';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [dirty]);
 
   const fx = settings.fx || DEFAULT_FX;
 
   // Position handlers
-  const updatePosition = (pos) =>
+  const updatePosition = (pos) => {
     setPortfolio((arr) => arr.map((x) => (x.id === pos.id ? pos : x)));
-  const updatePositionWithCascade = (pos /* oldTicker */) => {
-    // Trade-Log existiert nicht mehr – kein Cascade nötig. Signatur bleibt für Compat.
-    setPortfolio((arr) => arr.map((x) => (x.id === pos.id ? pos : x)));
+    markDirty();
   };
-  const deletePosition = (id) =>
+  const updatePositionWithCascade = (pos /* oldTicker */) => {
+    setPortfolio((arr) => arr.map((x) => (x.id === pos.id ? pos : x)));
+    markDirty();
+  };
+  const deletePosition = (id) => {
     setPortfolio((arr) => arr.filter((x) => x.id !== id));
-  const addPosition = (pos) => setPortfolio((arr) => [pos, ...arr]);
-  const addPositions = (positions) => setPortfolio((arr) => [...positions, ...arr]);
+    markDirty();
+  };
+  const addPosition = (pos) => { setPortfolio((arr) => [pos, ...arr]); markDirty(); };
+  const addPositions = (positions) => { setPortfolio((arr) => [...positions, ...arr]); markDirty(); };
 
   // DD-Updates aus dem Coach-Assessment auf eine Position anwenden.
   // update: { ticker, field, op: '+'|'-'|'=', value }
@@ -3390,6 +3464,7 @@ export default function App() {
       applied = true;
       return { ...p, dueDiligence: newDD, note: update.field === 'thesis' ? update.value : p.note };
     }));
+    if (applied) markDirty();
     return applied;
   };
 
@@ -3418,6 +3493,7 @@ export default function App() {
       applied = true;
       return { ...w, dueDiligence: newDD, thesis: update.field === 'thesis' ? update.value : w.thesis };
     }));
+    if (applied) markDirty();
     return applied;
   };
 
@@ -3473,11 +3549,13 @@ export default function App() {
   }, [hydrated, settings.finnhubKey]);
 
   // Watchlist handlers
-  const addWatchlist = (w) => setWatchlist((arr) => [w, ...arr]);
-  const addWatchlistMany = (items) => setWatchlist((arr) => [...items, ...arr]);
-  const updateWatchlist = (w) =>
+  const addWatchlist = (w) => { setWatchlist((arr) => [w, ...arr]); markDirty(); };
+  const addWatchlistMany = (items) => { setWatchlist((arr) => [...items, ...arr]); markDirty(); };
+  const updateWatchlist = (w) => {
     setWatchlist((arr) => arr.map((x) => (x.id === w.id ? w : x)));
-  const removeWatchlist = (id) => setWatchlist((arr) => arr.filter((x) => x.id !== id));
+    markDirty();
+  };
+  const removeWatchlist = (id) => { setWatchlist((arr) => arr.filter((x) => x.id !== id)); markDirty(); };
   const addWatchlistFromAI = (s) => {
     if (watchlist.some((w) => w.ticker === s.ticker)) return;
     addWatchlist({
@@ -3497,11 +3575,30 @@ export default function App() {
     setTab('portfolio');
   };
 
+  // Chat: zwei Modi — lokal löschen (bleibt unsaved) vs. Sheet löschen (sofort)
+  const wrappedSetChatHistory = (next) => {
+    setChatHistory(next);
+    markDirty();
+  };
+  const clearChatInSheet = async () => {
+    if (!session) return;
+    if (!confirm('Kompletten Chat-Verlauf im Sheet löschen?')) return;
+    try {
+      await aiClearChat(session.adminUrl, session.token);
+      setChatHistory([]);
+      setDirty(false);
+      setLastSavedAt(Date.now());
+    } catch (e) {
+      alert('Chat-Löschen fehlgeschlagen: ' + (e.message || e));
+    }
+  };
+
   const reset = () => {
-    setPortfolio(migrateDD(DEMO_PORTFOLIO));
-    setWatchlist(DEMO_WATCHLIST);
+    setPortfolio([]);
+    setWatchlist([]);
     setChatHistory([]);
     setSettingsState({ fx: DEFAULT_FX });
+    markDirty();
   };
 
   const finishOnboarding = () => {
@@ -3523,11 +3620,28 @@ export default function App() {
     coach: 'Coach',
   };
 
-  if (!hydrated) {
+  if (bootstrapPhase === 'booting' || bootstrapPhase === 'loading') {
     return (
-      <div className="min-h-screen bg-black flex items-center justify-center">
+      <div className="min-h-screen bg-black flex flex-col items-center justify-center gap-3">
         <Spinner size={6} />
+        <p className="text-neutral-400 text-sm">{bootstrapPhase === 'loading' ? 'Lade Daten aus Sheet…' : 'Initialisiere…'}</p>
       </div>
+    );
+  }
+
+  if (bootstrapPhase === 'login') {
+    return (
+      <>
+        <LoginScreen
+          initialAdminUrl={session?.adminUrl || ''}
+          onLogin={handleLogin}
+        />
+        {bootstrapErr && (
+          <div className="fixed top-4 left-1/2 -translate-x-1/2 bg-red-950/90 border border-red-500/40 text-red-300 px-4 py-2 rounded-lg text-sm">
+            {bootstrapErr}
+          </div>
+        )}
+      </>
     );
   }
 
@@ -3578,12 +3692,13 @@ export default function App() {
             fx={fx}
             apiKey={settings.apiKey}
             chatHistory={chatHistory}
-            setChatHistory={setChatHistory}
+            setChatHistory={wrappedSetChatHistory}
             onAddWatchlistFromAI={addWatchlistFromAI}
             onApplyDDUpdate={applyDDUpdate}
             onApplyWatchlistDDUpdate={applyWatchlistDDUpdate}
             assessmentTrigger={assessmentTrigger}
             onAssessmentDone={() => {}}
+            onClearChatInSheet={clearChatInSheet}
           />
         )}
 
@@ -3607,6 +3722,8 @@ export default function App() {
           onAddMany={addPositions}
           apiKey={settings.apiKey}
           finnhubKey={settings.finnhubKey}
+          adminUrl={session?.adminUrl}
+          token={session?.token}
         />
 
         <SettingsModal
@@ -3615,18 +3732,19 @@ export default function App() {
           settings={settings}
           setSettings={setSettingsState}
           onReset={reset}
-          portfolio={portfolio}
-          watchlist={watchlist}
-          onImport={(data) => {
-            setPortfolio(migrateDD(data.portfolio || []));
-            setWatchlist(Array.isArray(data.watchlist) ? data.watchlist : []);
-            if (data.settings?.fx) {
-              setSettingsState((s) => ({ ...s, fx: { ...DEFAULT_FX, ...data.settings.fx, CHF: 1 } }));
-            }
-          }}
+          session={session}
+          onLogout={handleLogout}
         />
 
         {showOnboarding && <Onboarding onClose={finishOnboarding} />}
+
+        <SaveButton
+          dirty={dirty}
+          saving={saving}
+          lastSavedAt={lastSavedAt}
+          error={saveError}
+          onSave={doSave}
+        />
       </div>
     </div>
   );
