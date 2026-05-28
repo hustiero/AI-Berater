@@ -735,6 +735,224 @@ async function stockSearch(adminUrl, token, query) {
 }
 
 /* =========================================================
+   CSV-Parser für Saxo-Bank Transaktions-Exports
+   Format: semicolon-separated, „Datum;Auftrag #;Transaktionen;Symbol;
+   Name;ISIN;Anzahl;Stückpreis;Kosten;Aufgelaufene Zinsen;Nettobetrag;
+   Währung Nettobetrag;Nettobetrag in der Währung des Kontos;Saldo;Währung"
+   ========================================================= */
+
+const TX_TYPE_MAP = {
+  'Kauf': 'buy',
+  'Verkauf': 'sell',
+  'Dividende': 'dividend',
+  'Capital Gain': 'capital_gain',
+  'Zinsen auf Einlagen': 'interest_in',
+  'Zinsen auf Belastungen': 'interest_out',
+  'Depotgebühren': 'fee_custody',
+  'Berichtigung Börsengeb.': 'fee_correction',
+  'Forex-Gutschrift': 'fx',
+  'Forex-Belastung': 'fx',
+  'Fx-Gutschrift Comp.': 'fx',
+  'Fx-Belastung Comp.': 'fx',
+  'Zahlung': 'deposit',
+  'Auszahlung': 'withdrawal',
+};
+
+function parseGermanNumber(raw) {
+  if (raw == null || raw === '') return null;
+  const s = String(raw).trim().replace(/'/g, '').replace(/\s/g, '');
+  // Saxo verwendet meist Punkt als Dezimaltrenner, kann aber Komma sein.
+  // Wir akzeptieren beides. Tausenderpunkte sind selten in diesem Format.
+  const normalized = s.includes(',') && !s.includes('.') ? s.replace(',', '.') : s;
+  const n = parseFloat(normalized);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseSaxoDate(raw) {
+  if (!raw) return null;
+  // "31-12-2025 23:40:42" → "2025-12-31"
+  const m = String(raw).trim().match(/^(\d{1,2})-(\d{1,2})-(\d{4})/);
+  if (!m) return null;
+  const [, d, mo, y] = m;
+  return `${y}-${mo.padStart(2, '0')}-${d.padStart(2, '0')}`;
+}
+
+function splitCsvLine(line) {
+  // CSV-Splitter, der Anführungszeichen respektiert.
+  const out = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') { inQuotes = !inQuotes; continue; }
+    if (c === ';' && !inQuotes) { out.push(cur); cur = ''; continue; }
+    cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+
+function parseSaxoCsv(text) {
+  const lines = String(text).split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length < 2) return { transactions: [], errors: ['Keine Daten in CSV.'] };
+  const header = splitCsvLine(lines[0]);
+  // Erwartete Spalten in Saxo-CSV. Wir indexieren tolerant über Synonyme.
+  const findIdx = (...names) => {
+    for (const n of names) {
+      const i = header.findIndex((h) => h.toLowerCase().includes(n.toLowerCase()));
+      if (i >= 0) return i;
+    }
+    return -1;
+  };
+  const idx = {
+    date: findIdx('Datum'),
+    type: findIdx('Transaktion'),
+    symbol: findIdx('Symbol'),
+    name: findIdx('Name'),
+    isin: findIdx('ISIN'),
+    qty: findIdx('Anzahl'),
+    price: findIdx('ckpreis', 'preis'), // Stückpreis hat Umlaut-Encoding-Probleme
+    fees: findIdx('Kosten'),
+    accruedInterest: findIdx('Aufgelaufene'),
+    net: findIdx('Nettobetrag'),
+    netCcy: findIdx('hrung Nettobetrag', 'Währung Nettobetrag'),
+    netAccount: findIdx('hrung des Kontos', 'Währung des Kontos'),
+    accountCcy: header.length - 1, // letzte Spalte
+  };
+  const errors = [];
+  const transactions = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = splitCsvLine(lines[i]);
+    if (cells.length < 5) continue;
+    const typeRaw = (cells[idx.type] || '').trim();
+    const mapped = TX_TYPE_MAP[typeRaw] || 'other';
+    const tx = {
+      id: uid(),
+      date: parseSaxoDate(cells[idx.date]),
+      type: mapped,
+      typeRaw,
+      symbol: (cells[idx.symbol] || '').trim(),
+      name: (cells[idx.name] || '').trim().replace(/^"|"$/g, ''),
+      isin: (cells[idx.isin] || '').trim(),
+      qty: idx.qty >= 0 ? parseGermanNumber(cells[idx.qty]) : null,
+      price: idx.price >= 0 ? parseGermanNumber(cells[idx.price]) : null,
+      fees: idx.fees >= 0 ? parseGermanNumber(cells[idx.fees]) : null,
+      accruedInterest: idx.accruedInterest >= 0 ? parseGermanNumber(cells[idx.accruedInterest]) : null,
+      netAmount: idx.net >= 0 ? parseGermanNumber(cells[idx.net]) : null,
+      currency: idx.netCcy >= 0 ? (cells[idx.netCcy] || '').trim() : '',
+      netAccountCurrency: idx.netAccount >= 0 ? parseGermanNumber(cells[idx.netAccount]) : null,
+      accountCurrency: idx.accountCcy >= 0 ? (cells[idx.accountCcy] || '').trim() : '',
+      source: 'saxo-csv',
+      importedAt: Date.now(),
+    };
+    if (!tx.date) { errors.push(`Zeile ${i + 1}: Datum ungültig`); continue; }
+    transactions.push(tx);
+  }
+  return { transactions, errors };
+}
+
+/* =========================================================
+   Schweizer Steuer-Aggregat
+   ========================================================= */
+
+const SWISS_TAX_TYPES_INCOME = new Set(['dividend', 'capital_gain', 'interest_in']);
+const SWISS_TAX_TYPES_DEDUCTION = new Set(['fee_custody', 'interest_out']);
+
+function isSwissIsin(isin) {
+  return typeof isin === 'string' && isin.toUpperCase().startsWith('CH');
+}
+
+function computeTaxSummary(transactions, year) {
+  // Jahr-Filter: 'all' oder YYYY-Number/String
+  const yearStr = year && year !== 'all' ? String(year) : null;
+  const inYear = (tx) => !yearStr || (tx.date || '').startsWith(yearStr);
+
+  const summary = {
+    year: yearStr || 'alle',
+    txCount: 0,
+    // Erträge brutto (für Wertschriftenverzeichnis)
+    incomeGrossCH: 0,    // CH-Aktien Brutto-Dividenden + Capital-Gain
+    incomeGrossFOR: 0,   // ausländische Brutto-Dividenden
+    interestIn: 0,       // Zinsen auf Einlagen
+    // Steuern-Abzüge (rückforderbar)
+    withholdingCH: 0,    // Verrechnungssteuer (CH), 35% rückforderbar
+    withholdingFOR: 0,   // Quellensteuer Ausland (DA-1 anrechenbar)
+    // Ausgaben (steuerlich abzugsfähig)
+    feesCustody: 0,
+    interestOut: 0,
+    // Trades (steuerfrei für Privatperson)
+    buysTotal: 0,
+    sellsTotal: 0,
+    buysCount: 0,
+    sellsCount: 0,
+    // Per-Position-Aufstellung der Erträge
+    perPosition: {}, // key=isin → { name, ccy, brutto, qst, netto, ch }
+  };
+
+  for (const tx of transactions) {
+    if (!inYear(tx)) continue;
+    summary.txCount += 1;
+    const ch = isSwissIsin(tx.isin);
+    const ccy = tx.currency || '';
+    const net = Number(tx.netAmount || 0);
+    const fees = Number(tx.fees || 0);
+    const qty = Number(tx.qty || 0);
+    const price = Number(tx.price || 0);
+
+    if (tx.type === 'dividend' || tx.type === 'capital_gain') {
+      // Bei Dividende/Capital-Gain: Brutto = qty × price; Kosten = Quellensteuer; Netto = Brutto − QSt
+      const brutto = qty * price;
+      const qst = fees;
+      if (ch) {
+        summary.incomeGrossCH += brutto;
+        summary.withholdingCH += qst;
+      } else {
+        summary.incomeGrossFOR += brutto;
+        summary.withholdingFOR += qst;
+      }
+      const k = tx.isin || tx.symbol || tx.name;
+      if (!summary.perPosition[k]) {
+        summary.perPosition[k] = { isin: tx.isin, symbol: tx.symbol, name: tx.name, ccy, brutto: 0, qst: 0, netto: 0, ch, entries: 0 };
+      }
+      summary.perPosition[k].brutto += brutto;
+      summary.perPosition[k].qst += qst;
+      summary.perPosition[k].netto += net;
+      summary.perPosition[k].entries += 1;
+    } else if (tx.type === 'interest_in') {
+      summary.interestIn += net;
+    } else if (tx.type === 'interest_out') {
+      summary.interestOut += Math.abs(net);
+    } else if (tx.type === 'fee_custody' || tx.type === 'fee_correction') {
+      summary.feesCustody += Math.abs(net);
+    } else if (tx.type === 'buy') {
+      summary.buysTotal += Math.abs(net);
+      summary.buysCount += 1;
+    } else if (tx.type === 'sell') {
+      summary.sellsTotal += Math.abs(net);
+      summary.sellsCount += 1;
+    }
+  }
+  return summary;
+}
+
+function txTypeLabel(type) {
+  return {
+    buy: 'Kauf',
+    sell: 'Verkauf',
+    dividend: 'Dividende',
+    capital_gain: 'Kapitalgewinn (Fonds)',
+    interest_in: 'Zinsertrag',
+    interest_out: 'Schuldzins',
+    fee_custody: 'Depotgebühr',
+    fee_correction: 'Gebühr-Korrektur',
+    fx: 'FX-Umrechnung',
+    deposit: 'Einzahlung',
+    withdrawal: 'Auszahlung',
+    other: 'Andere',
+  }[type] || type;
+}
+
+/* =========================================================
    Helpers
    ========================================================= */
 
@@ -2927,7 +3145,7 @@ function SuggestionCard({ suggestion, onAccept }) {
    Settings Modal
    ========================================================= */
 
-function SettingsModal({ open, onClose, settings, setSettings, onReset, session, onLogout }) {
+function SettingsModal({ open, onClose, settings, setSettings, onReset, session, onLogout, onOpenTax }) {
   const [fx, setFx] = useState(settings.fx);
   const [apiKey, setApiKey] = useState(settings.apiKey || '');
   const [finnhubKey, setFinnhubKey] = useState(settings.finnhubKey || '');
@@ -2988,6 +3206,14 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset, session,
           Optional. Free-Plan auf finnhub.io. Für CH/EU-Aktien nicht zwingend – Yahoo-Fallback greift.
         </p>
         <TextField label="Finnhub Token" type="password" value={finnhubKey} onChange={setFinnhubKey} placeholder="cv…" />
+      </Card>
+      <Card className="p-4 mb-3">
+        <h4 className="text-white font-semibold mb-2">🧾 Steuern (CH)</h4>
+        <p className="text-neutral-400 text-xs mb-3">
+          Saxo-CSV importieren → Jahres-Übersicht (Dividenden, Verrechnungs- &amp; Quellensteuer, Depotgebühren) + Export
+          für Steuerberater.
+        </p>
+        <GhostBtn onClick={() => { onClose(); onOpenTax?.(); }}>Öffnen</GhostBtn>
       </Card>
       <Card className="p-4 mb-3">
         <h4 className="text-white font-semibold mb-2">FX-Raten (zu CHF)</h4>
@@ -3180,6 +3406,348 @@ function TickerSearchField({ label, value, onChange, onPick, adminUrl, token, pl
   );
 }
 
+/* =========================================================
+   Steuer-Modal: CSV-Import + Übersicht + Liste + Export
+   ========================================================= */
+
+function TaxModal({ open, onClose, transactions, onSetTransactions, onClearTransactions, fx }) {
+  const [view, setView] = useState('summary'); // summary | list | import
+  const [year, setYear] = useState(() => {
+    const now = new Date();
+    return String(now.getFullYear() - (now.getMonth() < 3 ? 1 : 0)); // Default: Vorjahr nach Q1
+  });
+  const [importText, setImportText] = useState('');
+  const [importErr, setImportErr] = useState('');
+  const [importBusy, setImportBusy] = useState(false);
+  const fileRef = useRef(null);
+
+  const summary = useMemo(() => computeTaxSummary(transactions, year), [transactions, year]);
+  const years = useMemo(() => {
+    const s = new Set();
+    transactions.forEach((t) => { if (t.date) s.add(t.date.slice(0, 4)); });
+    return Array.from(s).sort().reverse();
+  }, [transactions]);
+  const filteredTx = useMemo(() => {
+    if (year === 'all') return transactions;
+    return transactions.filter((t) => (t.date || '').startsWith(year));
+  }, [transactions, year]);
+
+  const handleFile = async (e) => {
+    setImportErr('');
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportBusy(true);
+    try {
+      // Saxo-CSVs sind oft Windows-1252 codiert (Umlaute kaputt in UTF-8-Read).
+      // Wir lesen als ArrayBuffer und versuchen utf-8, fallen auf windows-1252 zurück.
+      const buf = await file.arrayBuffer();
+      let text = new TextDecoder('utf-8').decode(buf);
+      if (text.includes('�')) {
+        text = new TextDecoder('windows-1252').decode(buf);
+      }
+      setImportText(text);
+      const { transactions: newTx, errors } = parseSaxoCsv(text);
+      if (newTx.length === 0) {
+        setImportErr(errors[0] || 'Keine Transaktionen erkannt.');
+      } else {
+        // Dedupe per Datum+Type+Symbol+Net
+        const existingKey = new Set(transactions.map((t) => `${t.date}|${t.type}|${t.symbol}|${t.netAmount}|${t.currency}`));
+        const fresh = newTx.filter((t) => !existingKey.has(`${t.date}|${t.type}|${t.symbol}|${t.netAmount}|${t.currency}`));
+        if (fresh.length === 0) {
+          setImportErr(`Alle ${newTx.length} Einträge bereits importiert.`);
+        } else {
+          onSetTransactions([...fresh, ...transactions]);
+          setImportErr('');
+          setView('summary');
+        }
+      }
+    } catch (err) {
+      setImportErr(err.message || 'Datei konnte nicht gelesen werden.');
+    } finally {
+      setImportBusy(false);
+      if (fileRef.current) fileRef.current.value = '';
+    }
+  };
+
+  const handleTextImport = () => {
+    setImportErr('');
+    if (!importText.trim()) return setImportErr('Bitte CSV-Inhalt einfügen.');
+    const { transactions: newTx, errors } = parseSaxoCsv(importText);
+    if (newTx.length === 0) return setImportErr(errors[0] || 'Keine Transaktionen erkannt.');
+    const existingKey = new Set(transactions.map((t) => `${t.date}|${t.type}|${t.symbol}|${t.netAmount}|${t.currency}`));
+    const fresh = newTx.filter((t) => !existingKey.has(`${t.date}|${t.type}|${t.symbol}|${t.netAmount}|${t.currency}`));
+    if (fresh.length === 0) return setImportErr(`Alle ${newTx.length} Einträge bereits importiert.`);
+    onSetTransactions([...fresh, ...transactions]);
+    setView('summary');
+    setImportText('');
+  };
+
+  const exportTaxCsv = () => {
+    const rows = [
+      ['Datum','Typ','Symbol','Name','ISIN','Anzahl','Stückpreis','Kosten/Quellensteuer','Nettobetrag','Währung','CH','Verrechnungssteuer (CH)','Quellensteuer Ausland'],
+    ];
+    filteredTx.forEach((t) => {
+      const ch = isSwissIsin(t.isin);
+      const isDividend = t.type === 'dividend' || t.type === 'capital_gain';
+      rows.push([
+        t.date,
+        txTypeLabel(t.type),
+        t.symbol,
+        t.name,
+        t.isin,
+        t.qty,
+        t.price,
+        t.fees,
+        t.netAmount,
+        t.currency,
+        ch ? 'CH' : 'AUSLAND',
+        isDividend && ch ? (t.fees || 0) : '',
+        isDividend && !ch ? (t.fees || 0) : '',
+      ]);
+    });
+    const csv = rows.map((r) => r.map((v) => {
+      if (v == null) return '';
+      const s = String(v);
+      return s.includes(';') || s.includes('"') ? `"${s.replace(/"/g, '""')}"` : s;
+    }).join(';')).join('\n');
+    const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `steuern-${year}-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <Modal open={open} onClose={onClose} title="🧾 Steuern (CH)">
+      <div className="flex gap-2 mb-3">
+        {[
+          { v: 'summary', l: 'Übersicht' },
+          { v: 'list', l: `Transaktionen (${filteredTx.length})` },
+          { v: 'import', l: 'Import' },
+        ].map((b) => (
+          <button
+            key={b.v}
+            onClick={() => setView(b.v)}
+            className={`flex-1 px-2 py-1.5 rounded-lg text-xs font-medium transition ${
+              view === b.v ? 'bg-orange-500 text-black' : 'bg-neutral-800 text-neutral-300'
+            }`}
+          >
+            {b.l}
+          </button>
+        ))}
+      </div>
+
+      {(view === 'summary' || view === 'list') && years.length > 0 && (
+        <div className="mb-3">
+          <label className="block text-xs font-medium text-neutral-400 mb-1">Steuerjahr</label>
+          <select
+            value={year}
+            onChange={(e) => setYear(e.target.value)}
+            className="w-full bg-neutral-900 border border-neutral-700 rounded-xl px-3 py-2.5 text-white focus:outline-none focus:border-orange-500"
+          >
+            {years.map((y) => <option key={y} value={y}>{y}</option>)}
+            <option value="all">Alle Jahre</option>
+          </select>
+        </div>
+      )}
+
+      {view === 'summary' && (
+        transactions.length === 0 ? (
+          <Card className="p-6 text-center">
+            <p className="text-neutral-400 text-sm">Noch keine Transaktionen importiert.</p>
+            <button onClick={() => setView('import')} className="mt-3 text-orange-400 text-sm font-medium hover:underline">
+              Saxo-CSV importieren →
+            </button>
+          </Card>
+        ) : (
+          <div className="space-y-3">
+            <Card className="p-4">
+              <h4 className="text-white font-semibold mb-2 text-sm">Erträge {summary.year}</h4>
+              <div className="space-y-1.5 text-sm">
+                <div className="flex items-center justify-between">
+                  <span className="text-neutral-400">Dividenden CH (brutto)</span>
+                  <span className="text-white tabular-nums">{summary.incomeGrossCH.toFixed(2)}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-neutral-400">Dividenden Ausland (brutto)</span>
+                  <span className="text-white tabular-nums">{summary.incomeGrossFOR.toFixed(2)}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-neutral-400">Zinsertrag</span>
+                  <span className="text-white tabular-nums">{summary.interestIn.toFixed(2)}</span>
+                </div>
+              </div>
+            </Card>
+
+            <Card className="p-4">
+              <h4 className="text-white font-semibold mb-2 text-sm">Steuerabzüge {summary.year}</h4>
+              <div className="space-y-1.5 text-sm">
+                <div className="flex items-center justify-between">
+                  <span className="text-green-400">Verrechnungssteuer CH (rückforderbar)</span>
+                  <span className="text-white tabular-nums">{summary.withholdingCH.toFixed(2)}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-blue-400">Quellensteuer Ausland (DA-1 anrechenbar)</span>
+                  <span className="text-white tabular-nums">{summary.withholdingFOR.toFixed(2)}</span>
+                </div>
+              </div>
+              <p className="text-[10px] text-neutral-500 mt-2">
+                Verrechnungssteuer = 35% auf CH-Erträge, voll rückforderbar. Ausländische Quellensteuer max. via DA-1 anrechenbar (US-Vertrag: 15%).
+              </p>
+            </Card>
+
+            <Card className="p-4">
+              <h4 className="text-white font-semibold mb-2 text-sm">Abzugsfähige Kosten</h4>
+              <div className="space-y-1.5 text-sm">
+                <div className="flex items-center justify-between">
+                  <span className="text-neutral-400">Depotgebühren</span>
+                  <span className="text-white tabular-nums">{summary.feesCustody.toFixed(2)}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-neutral-400">Schuldzinsen</span>
+                  <span className="text-white tabular-nums">{summary.interestOut.toFixed(2)}</span>
+                </div>
+              </div>
+            </Card>
+
+            <Card className="p-4">
+              <h4 className="text-white font-semibold mb-2 text-sm">Trades (steuerfrei privat)</h4>
+              <div className="space-y-1.5 text-sm">
+                <div className="flex items-center justify-between">
+                  <span className="text-neutral-400">Käufe ({summary.buysCount})</span>
+                  <span className="text-white tabular-nums">{summary.buysTotal.toFixed(2)}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-neutral-400">Verkäufe ({summary.sellsCount})</span>
+                  <span className="text-white tabular-nums">{summary.sellsTotal.toFixed(2)}</span>
+                </div>
+              </div>
+              <p className="text-[10px] text-neutral-500 mt-2">
+                Kapitalgewinne aus Wertschriften sind für Privatpersonen in der Schweiz steuerfrei.
+              </p>
+            </Card>
+
+            {Object.keys(summary.perPosition).length > 0 && (
+              <Card className="p-4">
+                <h4 className="text-white font-semibold mb-2 text-sm">Erträge pro Position</h4>
+                <div className="space-y-2">
+                  {Object.entries(summary.perPosition)
+                    .sort((a, b) => b[1].brutto - a[1].brutto)
+                    .map(([k, p]) => (
+                      <div key={k} className="text-xs border-l-2 border-neutral-700 pl-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-white font-medium truncate">
+                            {p.name || p.symbol || k}
+                            <span className="text-neutral-500 ml-1">({p.ch ? 'CH' : 'Ausl.'})</span>
+                          </span>
+                          <span className="text-white tabular-nums ml-2">{p.brutto.toFixed(2)} {p.ccy}</span>
+                        </div>
+                        <p className="text-neutral-500">
+                          {p.entries} {p.entries === 1 ? 'Ausschüttung' : 'Ausschüttungen'}
+                          {p.qst > 0 && <> · {p.ch ? 'VST' : 'QSt Ausl.'} {p.qst.toFixed(2)}</>}
+                        </p>
+                      </div>
+                    ))}
+                </div>
+              </Card>
+            )}
+
+            <GhostBtn onClick={exportTaxCsv}>📥 CSV für Steuerberater exportieren</GhostBtn>
+          </div>
+        )
+      )}
+
+      {view === 'list' && (
+        <div className="space-y-1.5">
+          {filteredTx.length === 0 ? (
+            <p className="text-neutral-500 text-sm text-center py-6">Keine Transaktionen in {summary.year}.</p>
+          ) : filteredTx.slice(0, 200).map((t) => {
+            const ch = isSwissIsin(t.isin);
+            return (
+              <div key={t.id} className="bg-neutral-900/60 border border-neutral-800 rounded-lg p-2 text-xs">
+                <div className="flex items-center justify-between mb-0.5">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <Pill color={t.type === 'buy' ? 'green' : t.type === 'sell' ? 'red' : t.type === 'dividend' || t.type === 'capital_gain' ? 'accent' : 'neutral'}>
+                      {txTypeLabel(t.type)}
+                    </Pill>
+                    {t.isin && <Pill color={ch ? 'blue' : 'neutral'}>{ch ? 'CH' : 'Ausl.'}</Pill>}
+                  </div>
+                  <span className="text-neutral-500">{t.date}</span>
+                </div>
+                {(t.symbol || t.name) && (
+                  <p className="text-white truncate">{t.symbol} {t.name && <span className="text-neutral-400">· {t.name}</span>}</p>
+                )}
+                <div className="flex items-center justify-between text-neutral-400 mt-0.5">
+                  <span>{t.qty != null ? `${t.qty} ×` : ''} {t.price != null ? t.price.toFixed(4) : ''}{t.fees ? ` · Kosten ${t.fees.toFixed(2)}` : ''}</span>
+                  <span className="text-white tabular-nums">{t.netAmount != null ? t.netAmount.toFixed(2) : '—'} {t.currency}</span>
+                </div>
+              </div>
+            );
+          })}
+          {filteredTx.length > 200 && (
+            <p className="text-[11px] text-neutral-500 text-center pt-2">Erste 200 von {filteredTx.length} angezeigt.</p>
+          )}
+        </div>
+      )}
+
+      {view === 'import' && (
+        <div className="space-y-3">
+          <Card className="p-4">
+            <h4 className="text-white font-semibold mb-2 text-sm">Saxo-CSV importieren</h4>
+            <p className="text-neutral-400 text-xs mb-3">
+              Im Saxo-Banking: „Konto-Auszug" → „Transaktionen" → CSV exportieren. Beim Import werden Duplikate
+              automatisch übersprungen.
+            </p>
+            <GhostBtn onClick={() => fileRef.current?.click()} className={importBusy ? 'opacity-50 pointer-events-none' : ''}>
+              {importBusy ? <span className="flex items-center justify-center gap-2"><Spinner size={3} /> Lese…</span> : 'Datei auswählen…'}
+            </GhostBtn>
+            <input ref={fileRef} type="file" accept=".csv,text/csv" onChange={handleFile} className="hidden" />
+          </Card>
+
+          <Card className="p-4">
+            <h4 className="text-white font-semibold mb-2 text-sm">Oder CSV-Text einfügen</h4>
+            <textarea
+              value={importText}
+              onChange={(e) => setImportText(e.target.value)}
+              rows={6}
+              placeholder="Datum;Auftrag #;Transaktionen;Symbol;…"
+              className="w-full bg-neutral-900 border border-neutral-700 rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-none focus:border-orange-500"
+            />
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              <GhostBtn onClick={() => setImportText('')}>Leeren</GhostBtn>
+              <PrimaryBtn onClick={handleTextImport} disabled={!importText.trim()}>Parsen</PrimaryBtn>
+            </div>
+          </Card>
+
+          {importErr && (
+            <div className="text-red-300 text-xs flex items-start gap-1.5 bg-red-950/40 border border-red-500/40 rounded-lg p-2">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /> {importErr}
+            </div>
+          )}
+
+          {transactions.length > 0 && (
+            <Card className="p-4">
+              <h4 className="text-white font-semibold mb-2 text-sm">Bestand</h4>
+              <p className="text-xs text-neutral-400 mb-3">
+                {transactions.length} Transaktionen importiert (Jahre: {years.join(', ') || '—'}).
+              </p>
+              <GhostBtn onClick={() => {
+                if (confirm('Wirklich alle importierten Transaktionen löschen?')) onClearTransactions();
+              }}>
+                Alle löschen
+              </GhostBtn>
+            </Card>
+          )}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 function Onboarding({ onClose }) {
   return (
     <Modal
@@ -3282,12 +3850,14 @@ export default function App() {
   const [portfolio, setPortfolio] = useState([]);
   const [watchlist, setWatchlist] = useState([]);
   const [chatHistory, setChatHistory] = useState([]);
+  const [transactions, setTransactions] = useState([]);
   const [settings, setSettingsState] = useState({ fx: DEFAULT_FX });
   const [openPositionId, setOpenPositionId] = useState(null);
   const [portfolioInitialSort, setPortfolioInitialSort] = useState('mv');
   const [showAddPosition, setShowAddPosition] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showTax, setShowTax] = useState(false);
   const [assessmentTrigger, setAssessmentTrigger] = useState(0);
 
   // Session & Save-State
@@ -3334,18 +3904,21 @@ export default function App() {
     setBootstrapErr('');
     try {
       const data = await aiPull(sess.adminUrl, sess.token);
+      const sheetTx = Array.isArray(data.transactions) ? data.transactions : [];
       // Local draft kicks in only if sheet is empty AND draft is non-empty
       const draftP = await storage.get('portfolio');
       const draftW = await storage.get('watchlist');
       const draftC = await storage.get('chatHistory');
-      const sheetEmpty = data.portfolio.length === 0 && data.watchlist.length === 0 && data.chatHistory.length === 0;
-      const draftExists = (Array.isArray(draftP) && draftP.length > 0) || (Array.isArray(draftW) && draftW.length > 0) || (Array.isArray(draftC) && draftC.length > 0);
+      const draftT = await storage.get('transactions');
+      const sheetEmpty = data.portfolio.length === 0 && data.watchlist.length === 0 && data.chatHistory.length === 0 && sheetTx.length === 0;
+      const draftExists = (Array.isArray(draftP) && draftP.length > 0) || (Array.isArray(draftW) && draftW.length > 0) || (Array.isArray(draftC) && draftC.length > 0) || (Array.isArray(draftT) && draftT.length > 0);
       if (sheetEmpty && draftExists) {
         const useDraft = confirm('Lokale Drafts vorhanden, Sheet ist leer. Drafts laden? (Cancel = leeren Zustand verwenden)');
         if (useDraft) {
           setPortfolio(migrateDD(draftP || []));
           setWatchlist(Array.isArray(draftW) ? draftW : []);
           setChatHistory(Array.isArray(draftC) ? draftC : []);
+          setTransactions(Array.isArray(draftT) ? draftT : []);
           setDirty(true); // muss noch gepusht werden
           setBootstrapPhase('ready');
           return;
@@ -3354,6 +3927,7 @@ export default function App() {
       setPortfolio(migrateDD(data.portfolio));
       setWatchlist(data.watchlist);
       setChatHistory(data.chatHistory);
+      setTransactions(sheetTx);
       setDirty(false);
       setLastSavedAt(Date.now());
       setBootstrapPhase('ready');
@@ -3376,14 +3950,17 @@ export default function App() {
     await storage.remove('portfolio');
     await storage.remove('watchlist');
     await storage.remove('chatHistory');
+    await storage.remove('transactions');
     setSession(null);
     setPortfolio([]);
     setWatchlist([]);
     setChatHistory([]);
+    setTransactions([]);
     setDirty(false);
     setSaveError('');
     setLastSavedAt(null);
     setShowSettings(false);
+    setShowTax(false);
     setBootstrapPhase('login');
   };
 
@@ -3391,6 +3968,7 @@ export default function App() {
   useEffect(() => { if (bootstrapPhase === 'ready') storage.set('portfolio', portfolio); }, [portfolio, bootstrapPhase]);
   useEffect(() => { if (bootstrapPhase === 'ready') storage.set('watchlist', watchlist); }, [watchlist, bootstrapPhase]);
   useEffect(() => { if (bootstrapPhase === 'ready') storage.set('chatHistory', chatHistory); }, [chatHistory, bootstrapPhase]);
+  useEffect(() => { if (bootstrapPhase === 'ready') storage.set('transactions', transactions); }, [transactions, bootstrapPhase]);
   useEffect(() => { storage.set('settings', settings); }, [settings]);
 
   // Save: ai_push, dirty zurücksetzen
@@ -3398,7 +3976,7 @@ export default function App() {
     if (!session || saving) return;
     setSaving(true); setSaveError('');
     try {
-      await aiPush(session.adminUrl, session.token, { portfolio, watchlist, chatHistory });
+      await aiPush(session.adminUrl, session.token, { portfolio, watchlist, chatHistory, transactions });
       setDirty(false);
       setLastSavedAt(Date.now());
     } catch (e) {
@@ -3597,9 +4175,14 @@ export default function App() {
     setPortfolio([]);
     setWatchlist([]);
     setChatHistory([]);
+    setTransactions([]);
     setSettingsState({ fx: DEFAULT_FX });
     markDirty();
   };
+
+  // Transactions handlers
+  const setTransactionsAndMark = (next) => { setTransactions(next); markDirty(); };
+  const clearTransactions = () => { setTransactions([]); markDirty(); };
 
   const finishOnboarding = () => {
     setShowOnboarding(false);
@@ -3734,6 +4317,16 @@ export default function App() {
           onReset={reset}
           session={session}
           onLogout={handleLogout}
+          onOpenTax={() => setShowTax(true)}
+        />
+
+        <TaxModal
+          open={showTax}
+          onClose={() => setShowTax(false)}
+          transactions={transactions}
+          onSetTransactions={setTransactionsAndMark}
+          onClearTransactions={clearTransactions}
+          fx={fx}
         />
 
         {showOnboarding && <Onboarding onClose={finishOnboarding} />}
