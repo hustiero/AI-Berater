@@ -33,29 +33,51 @@ const DEMO_PORTFOLIO = [];
 const DEMO_WATCHLIST = [];
 
 /* =========================================================
-   Storage (window.storage)
+   Storage — localStorage primary, window.storage (Artifact-Runtime) fallback
    ========================================================= */
+
+const STORAGE_PREFIX = 'aiberater.';
 
 const storage = {
   async get(key) {
+    // 1) Artifact-Runtime (Claude Artifacts) wenn vorhanden
     try {
       if (typeof window !== 'undefined' && window.storage && typeof window.storage.getItem === 'function') {
         const v = await window.storage.getItem(key);
-        if (v == null) return null;
-        return typeof v === 'string' ? JSON.parse(v) : v;
+        if (v != null) return typeof v === 'string' ? JSON.parse(v) : v;
       }
     } catch (e) {
-      console.warn('storage.get', key, e);
+      console.warn('storage.get (artifact)', key, e);
+    }
+    // 2) Standard-Browser localStorage
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        const v = window.localStorage.getItem(STORAGE_PREFIX + key);
+        if (v == null) return null;
+        return JSON.parse(v);
+      }
+    } catch (e) {
+      console.warn('storage.get (localStorage)', key, e);
     }
     return null;
   },
   async set(key, value) {
+    let ok = false;
     try {
       if (typeof window !== 'undefined' && window.storage && typeof window.storage.setItem === 'function') {
         await window.storage.setItem(key, JSON.stringify(value));
+        ok = true;
       }
     } catch (e) {
-      console.warn('storage.set', key, e);
+      console.warn('storage.set (artifact)', key, e);
+    }
+    if (ok) return;
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(value));
+      }
+    } catch (e) {
+      console.warn('storage.set (localStorage)', key, e);
     }
   },
   async remove(key) {
@@ -64,7 +86,14 @@ const storage = {
         await window.storage.removeItem(key);
       }
     } catch (e) {
-      console.warn('storage.remove', key, e);
+      console.warn('storage.remove (artifact)', key, e);
+    }
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.removeItem(STORAGE_PREFIX + key);
+      }
+    } catch (e) {
+      console.warn('storage.remove (localStorage)', key, e);
     }
   },
 };
@@ -3240,6 +3269,115 @@ function SettingsModal({ open, onClose, settings, setSettings, onReset, session,
    ========================================================= */
 
 /* =========================================================
+   Boot-Screen (Diagnose statt schwarz)
+   ========================================================= */
+
+function BootScreen({ phase, error, session, onResetStorage, onForceLogin }) {
+  return (
+    <div className="min-h-screen bg-black text-white font-sans antialiased flex items-center justify-center px-4">
+      <div className="w-full max-w-sm">
+        <div className="text-center mb-6">
+          <Sparkles className="w-12 h-12 text-orange-400 mx-auto mb-3" />
+          <h1 className="text-xl font-bold">Mein Finanz-Coach</h1>
+        </div>
+        <Card className="p-5 text-sm">
+          <div className="flex items-center justify-center gap-2 mb-3 text-orange-400">
+            <Spinner size={4} />
+            <span className="font-medium">
+              {phase === 'loading' ? 'Lade Daten aus Sheet…' : 'Initialisiere…'}
+            </span>
+          </div>
+          {session?.adminUrl && (
+            <p className="text-[11px] text-neutral-500 mb-2 break-all">
+              Endpoint: {session.adminUrl}
+            </p>
+          )}
+          {session?.username && (
+            <p className="text-[11px] text-neutral-500 mb-2">
+              User: {session.username}
+            </p>
+          )}
+          {error && (
+            <div className="mt-3 text-red-300 text-xs bg-red-950/40 border border-red-500/40 rounded-lg p-2 whitespace-pre-wrap break-words">
+              <p className="font-semibold mb-1">⚠ {error}</p>
+            </div>
+          )}
+          <div className="mt-4 grid grid-cols-2 gap-2">
+            <GhostBtn onClick={onForceLogin}>Login öffnen</GhostBtn>
+            <GhostBtn onClick={() => { if (confirm('Lokalen Speicher zurücksetzen? Token + Drafts gehen verloren.')) onResetStorage(); }}>
+              Speicher löschen
+            </GhostBtn>
+          </div>
+          <p className="text-[10px] text-neutral-600 mt-3 text-center">
+            Sollte das endlos drehen → F12 öffnen → Console-Tab. Fehler werden dort geloggt.
+          </p>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================
+   Error-Boundary (verhindert blank screen bei Render-Crash)
+   ========================================================= */
+
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { err: null, info: null };
+  }
+  static getDerivedStateFromError(err) {
+    return { err };
+  }
+  componentDidCatch(err, info) {
+    // eslint-disable-next-line no-console
+    console.error('[AI-Berater] React Crash:', err, info);
+    this.setState({ info });
+  }
+  resetStorageAndReload = () => {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) window.localStorage.clear();
+    } catch {}
+    window.location.reload();
+  };
+  render() {
+    if (!this.state.err) return this.props.children;
+    return (
+      <div className="min-h-screen bg-black text-white p-4 font-sans antialiased">
+        <div className="max-w-md mx-auto">
+          <div className="text-center my-6">
+            <AlertTriangle className="w-12 h-12 text-red-400 mx-auto mb-3" />
+            <h1 className="text-xl font-bold">App-Fehler</h1>
+            <p className="text-neutral-400 text-sm mt-1">
+              Etwas ist beim Rendern abgestürzt. Details unten.
+            </p>
+          </div>
+          <Card className="p-4 mb-3">
+            <h4 className="text-white font-semibold mb-2 text-sm">Fehler</h4>
+            <pre className="text-xs text-red-300 whitespace-pre-wrap break-words">{String(this.state.err?.message || this.state.err)}</pre>
+            {this.state.err?.stack && (
+              <pre className="text-[10px] text-neutral-500 whitespace-pre-wrap break-words mt-2 max-h-48 overflow-y-auto">{this.state.err.stack}</pre>
+            )}
+          </Card>
+          <Card className="p-4">
+            <p className="text-xs text-neutral-400 mb-3">
+              Versuche zuerst die Seite neu zu laden. Falls der Fehler bleibt, lösche den lokalen Speicher
+              (Token + Drafts gehen verloren, das Sheet bleibt unangetastet).
+            </p>
+            <div className="grid grid-cols-2 gap-2">
+              <GhostBtn onClick={() => window.location.reload()}>Reload</GhostBtn>
+              <GhostBtn onClick={() => { if (confirm('Lokalen Speicher zurücksetzen?')) this.resetStorageAndReload(); }}>
+                Speicher löschen
+              </GhostBtn>
+            </div>
+          </Card>
+        </div>
+      </div>
+    );
+  }
+}
+
+/* =========================================================
    Login Screen
    ========================================================= */
 
@@ -3846,6 +3984,14 @@ function TopBar({ title, onSettings, onRefresh, refreshing, lastRefresh }) {
    ========================================================= */
 
 export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppInner />
+    </ErrorBoundary>
+  );
+}
+
+function AppInner() {
   const [tab, setTab] = useState('dashboard');
   const [portfolio, setPortfolio] = useState([]);
   const [watchlist, setWatchlist] = useState([]);
@@ -3871,31 +4017,60 @@ export default function App() {
 
   const markDirty = () => setDirty(true);
 
+  // Fail-safe: nach 12s im Booting/Loading-Status → Login öffnen,
+  // damit der User nie auf einem hängenden Spinner sitzen bleibt.
+  useEffect(() => {
+    if (bootstrapPhase !== 'booting' && bootstrapPhase !== 'loading') return;
+    const id = setTimeout(() => {
+      setBootstrapPhase((cur) => {
+        if (cur === 'booting' || cur === 'loading') {
+          setBootstrapErr((e) => e || 'Bootstrap-Timeout nach 12s — kein Response vom Backend. Schau in F12 → Console.');
+          return 'login';
+        }
+        return cur;
+      });
+    }, 12000);
+    return () => clearTimeout(id);
+  }, [bootstrapPhase]);
+
   // Step 1: bootstrap — check session + draft buffer
   useEffect(() => {
     (async () => {
-      const stored = await storage.get('session');
-      const onb = await storage.get('onboardingSeen');
-      const s = await storage.get('settings');
-      if (s) setSettingsState(s);
-      if (!onb) setShowOnboarding(true);
-      if (stored && stored.token && stored.adminUrl) {
-        // Try token. If valid → load sheet.
-        try {
-          const me = await authGetMe(stored.adminUrl, stored.token);
-          if (me && me.username) {
-            const next = { adminUrl: stored.adminUrl, token: stored.token, username: me.username };
-            setSession(next);
-            setBootstrapPhase('loading');
-            await loadFromSheet(next);
-            return;
+      try {
+        const stored = await storage.get('session');
+        const onb = await storage.get('onboardingSeen');
+        const s = await storage.get('settings');
+        if (s) setSettingsState(s);
+        if (!onb) setShowOnboarding(true);
+        if (stored && stored.token && stored.adminUrl) {
+          // Try token. If valid → load sheet.
+          try {
+            const me = await authGetMe(stored.adminUrl, stored.token);
+            if (me && me.username) {
+              const next = { adminUrl: stored.adminUrl, token: stored.token, username: me.username };
+              setSession(next);
+              setBootstrapPhase('loading');
+              await loadFromSheet(next);
+              return;
+            }
+            // get_me lieferte keinen Username – Session abgelaufen oder Backend liefert error
+            setBootstrapErr('Session abgelaufen oder Backend-Antwort ungültig — bitte erneut anmelden.');
+            // eslint-disable-next-line no-console
+            console.warn('[AI-Berater] get_me lieferte keinen username:', me);
+          } catch (e) {
+            setBootstrapErr(`Session-Check fehlgeschlagen: ${e.message || e}`);
+            // eslint-disable-next-line no-console
+            console.error('[AI-Berater] authGetMe error:', e);
           }
-        } catch {
-          // token invalid → fall through to login
+          await storage.remove('session');
         }
-        await storage.remove('session');
+        setBootstrapPhase('login');
+      } catch (e) {
+        setBootstrapErr(`Bootstrap-Fehler: ${e.message || e}`);
+        // eslint-disable-next-line no-console
+        console.error('[AI-Berater] bootstrap error:', e);
+        setBootstrapPhase('login');
       }
-      setBootstrapPhase('login');
     })();
     // eslint-disable-next-line
   }, []);
@@ -4204,12 +4379,13 @@ export default function App() {
   };
 
   if (bootstrapPhase === 'booting' || bootstrapPhase === 'loading') {
-    return (
-      <div className="min-h-screen bg-black flex flex-col items-center justify-center gap-3">
-        <Spinner size={6} />
-        <p className="text-neutral-400 text-sm">{bootstrapPhase === 'loading' ? 'Lade Daten aus Sheet…' : 'Initialisiere…'}</p>
-      </div>
-    );
+    return <BootScreen phase={bootstrapPhase} error={bootstrapErr} session={session} onResetStorage={async () => {
+      try {
+        if (typeof window !== 'undefined' && window.localStorage) window.localStorage.clear();
+        if (typeof window !== 'undefined' && window.storage && window.storage.clear) await window.storage.clear();
+      } catch {}
+      window.location.reload();
+    }} onForceLogin={() => { setBootstrapPhase('login'); }} />;
   }
 
   if (bootstrapPhase === 'login') {
@@ -4220,8 +4396,9 @@ export default function App() {
           onLogin={handleLogin}
         />
         {bootstrapErr && (
-          <div className="fixed top-4 left-1/2 -translate-x-1/2 bg-red-950/90 border border-red-500/40 text-red-300 px-4 py-2 rounded-lg text-sm">
-            {bootstrapErr}
+          <div className="fixed top-4 left-4 right-4 max-w-md mx-auto bg-red-950/90 border border-red-500/40 text-red-300 px-4 py-3 rounded-lg text-xs whitespace-pre-wrap break-words shadow-lg z-50">
+            <p className="font-semibold mb-1">⚠ {bootstrapErr}</p>
+            <p className="text-red-400/70">Details siehst du in der Browser-Konsole (F12 → Console).</p>
           </div>
         )}
       </>
